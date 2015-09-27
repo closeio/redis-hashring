@@ -2,3 +2,5 @@
 venv/
 *.egg
 *.egg-info/
+.cache
+.tox
