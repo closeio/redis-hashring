@@ -199,10 +199,12 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
         now = time.time()
         for replica in self.replicas:
-            pipeline.zadd(self.key, '{start}:{name}'.format(
-                start=replica[0],
-                name=replica[1]
-            ), now)
+            # for redis >=2.4, the signature is key, score, name
+            pipeline.zadd(
+                self.key,
+                now,
+                '{start}:{name}'.format(start=replica[0], name=replica[1])
+            )
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
