@@ -1,10 +1,16 @@
-from redis import Redis
 import unittest
+
+import pytest
+from redis import Redis
+
 from redis_hashring import RingNode
 
 TEST_KEY = 'hashring-test'
 
+
+@pytest.mark.requires_redis_server
 class HashRingTestCase(unittest.TestCase):
+
     def setUp(self):
         self.redis = Redis()
         self.redis.delete(TEST_KEY)
