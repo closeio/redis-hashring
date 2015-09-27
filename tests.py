@@ -1,8 +1,7 @@
-import unittest
 
 from mock import Mock
 import pytest
-from redis import Redis
+from redis import StrictRedis
 from fakeredis import FakeStrictRedis
 
 
@@ -13,7 +12,7 @@ TEST_KEY = 'hashring-test'
 
 class TestHashRingFunctional(object):
 
-    def tearDown(self):
+    def teardown(self):
         self.redis.delete(TEST_KEY)
 
     def get_node(self, n_replicas, total_replicas):
@@ -47,7 +46,7 @@ class TestHashRingFunctional(object):
 
     @pytest.mark.requires_redis_server
     def test_with_redis_server(self):
-        self.redis = Redis()
+        self.redis = StrictRedis()
         self.ring_assertions()
 
     def test_with_fake_redis_server(self, monkeypatch):

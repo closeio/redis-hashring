@@ -69,12 +69,12 @@ class RingNode(object):
         pid = os.getpid()
         # Create unique identifiers for the replicas
         self.replicas = [(
-            random.randrange(2**32),
+            str(random.randrange(2**32)).encode(),
             '{host}:{pid}:{rand}'.format(
                 host=host,
                 pid=pid,
-                rand=os.urandom(4).encode('hex')
-            )
+                rand=binascii.hexlify(os.urandom(4)).decode("utf-8")
+            ).encode('utf-8')
         ) for n in range(n_replicas)]
 
         # List of tuples of ranges this node is responsible for, where a tuple
@@ -97,7 +97,7 @@ class RingNode(object):
         ring = []
 
         for node_data in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = node_data.split(b':', 1)
             ring.append((int(start), replica))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -123,7 +123,7 @@ class RingNode(object):
         ring = []
 
         for node_data, heartbeat in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = node_data.split(b':', 1)
             ring.append((int(start), replica, heartbeat, heartbeat < expiry_time))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -149,7 +149,7 @@ class RingNode(object):
         nodes = collections.defaultdict(list)
 
         for n, (start, replica, heartbeat, expired) in enumerate(ring):
-            hostname, pid, rnd = replica.split(':')
+            hostname, pid, rnd = replica.split(b':')
             node = ':'.join([hostname, pid])
 
             abs_size = (ring[(n+1) % n_replicas][0] - ring[n][0]) % RING_SIZE
@@ -199,11 +199,12 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
         now = time.time()
         for replica in self.replicas:
-            # for redis >=2.4, the signature is key, score, name
+            # for redis-py >=2.4, the strict signature is key, score, name
+            # https://github.com/andymccurdy/redis-py/issues/72
             pipeline.zadd(
                 self.key,
                 now,
-                '{start}:{name}'.format(start=replica[0], name=replica[1])
+                b':'.join([replica[0], replica[1]])
             )
         ret = pipeline.execute()
 
