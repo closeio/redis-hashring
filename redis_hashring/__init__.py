@@ -69,12 +69,12 @@ class RingNode(object):
         pid = os.getpid()
         # Create unique identifiers for the replicas
         self.replicas = [(
-            random.randrange(2**32),
+            str(random.randrange(2**32)).encode(),
             '{host}:{pid}:{rand}'.format(
                 host=host,
                 pid=pid,
-                rand=os.urandom(4).encode('hex')
-            )
+                rand=binascii.hexlify(os.urandom(4)).decode("utf-8")
+            ).encode('utf-8')
         ) for n in range(n_replicas)]
 
         # List of tuples of ranges this node is responsible for, where a tuple
@@ -97,7 +97,7 @@ class RingNode(object):
         ring = []
 
         for node_data in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = node_data.split(b':', 1)
             ring.append((int(start), replica))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -123,7 +123,7 @@ class RingNode(object):
         ring = []
 
         for node_data, heartbeat in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = node_data.split(b':', 1)
             ring.append((int(start), replica, heartbeat, heartbeat < expiry_time))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -137,19 +137,19 @@ class RingNode(object):
 
         ring = self._fetch_all()
 
-        print 'Hash ring "{key}" replicas:'.format(key=self.key)
+        print('Hash ring "{key}" replicas:'.format(key=self.key))
 
         now = time.time()
         n_replicas = len(ring)
         if ring:
-            print '{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node')
+            print('{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node'))
         else:
-            print '(no replicas)'
+            print('(no replicas)')
 
         nodes = collections.defaultdict(list)
 
         for n, (start, replica, heartbeat, expired) in enumerate(ring):
-            hostname, pid, rnd = replica.split(':')
+            hostname, pid, rnd = replica.split(b':')
             node = ':'.join([hostname, pid])
 
             abs_size = (ring[(n+1) % n_replicas][0] - ring[n][0]) % RING_SIZE
@@ -158,21 +158,21 @@ class RingNode(object):
 
             nodes[node].append((hostname, pid, abs_size, delay, expired))
 
-            print '{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
+            print('{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
                 start=start,
                 replica=replica,
                 delay=delay,
                 size=size,
                 extra=' (EXPIRED)' if expired else ''
-            )
+            ))
 
-        print
-        print 'Hash ring "{key}" nodes:'.format(key=self.key)
+        print()
+        print('Hash ring "{key}" nodes:'.format(key=self.key))
 
         if nodes:
-            print '{:8} {:8} {:7} {:20} {:5}'.format('Range', 'Replicas', 'Delay', 'Hostname', 'PID')
+            print('{:8} {:8} {:7} {:20} {:5}'.format('Range', 'Replicas', 'Delay', 'Hostname', 'PID'))
         else:
-            print '(no nodes)'
+            print('(no nodes)')
 
         for k, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
@@ -181,7 +181,7 @@ class RingNode(object):
             delay = max(replica[3] for replica in v)
             expired = any(replica[4] for replica in v)
             count = len(v)
-            print '{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
+            print('{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
                 start=start,
                 count=count,
                 hostname=hostname,
@@ -189,7 +189,7 @@ class RingNode(object):
                 delay=delay,
                 size=size,
                 extra=' (EXPIRED)' if expired else ''
-            )
+            ))
 
     def heartbeat(self):
         """
@@ -199,10 +199,13 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
         now = time.time()
         for replica in self.replicas:
-            pipeline.zadd(self.key, '{start}:{name}'.format(
-                start=replica[0],
-                name=replica[1]
-            ), now)
+            # for redis-py >=2.4, the strict signature is key, score, name
+            # https://github.com/andymccurdy/redis-py/issues/72
+            pipeline.zadd(
+                self.key,
+                now,
+                b':'.join([replica[0], replica[1]])
+            )
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
@@ -298,7 +301,7 @@ class RingNode(object):
             timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
             r, w, x = self._select([fileno], [], [], timeout)
             if fileno in r:
-                message = gen.next()
+                gen.next()
                 self.update()
 
             last_heartbeat = time.time()
