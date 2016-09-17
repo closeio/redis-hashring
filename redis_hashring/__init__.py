@@ -1,3 +1,5 @@
+from __future__ import print_function
+
 import binascii
 import collections
 import socket
@@ -73,7 +75,7 @@ class RingNode(object):
             '{host}:{pid}:{rand}'.format(
                 host=host,
                 pid=pid,
-                rand=os.urandom(4).encode('hex')
+                rand=binascii.hexlify(os.urandom(4)).decode()
             )
         ) for n in range(n_replicas)]
 
@@ -97,7 +99,7 @@ class RingNode(object):
         ring = []
 
         for node_data in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = node_data.decode().split(':', 1)
             ring.append((int(start), replica))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -137,14 +139,14 @@ class RingNode(object):
 
         ring = self._fetch_all()
 
-        print 'Hash ring "{key}" replicas:'.format(key=self.key)
+        print('Hash ring "{key}" replicas:'.format(key=self.key))
 
         now = time.time()
         n_replicas = len(ring)
         if ring:
-            print '{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node')
+            print('{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node'))
         else:
-            print '(no replicas)'
+            print('(no replicas)')
 
         nodes = collections.defaultdict(list)
 
@@ -158,21 +160,21 @@ class RingNode(object):
 
             nodes[node].append((hostname, pid, abs_size, delay, expired))
 
-            print '{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
+            print('{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
                 start=start,
                 replica=replica,
                 delay=delay,
                 size=size,
                 extra=' (EXPIRED)' if expired else ''
-            )
+            ))
 
-        print
-        print 'Hash ring "{key}" nodes:'.format(key=self.key)
+        print()
+        print('Hash ring "{key}" nodes:'.format(key=self.key))
 
         if nodes:
-            print '{:8} {:8} {:7} {:20} {:5}'.format('Range', 'Replicas', 'Delay', 'Hostname', 'PID')
+            print('{:8} {:8} {:7} {:20} {:5}'.format('Range', 'Replicas', 'Delay', 'Hostname', 'PID'))
         else:
-            print '(no nodes)'
+            print('(no nodes)')
 
         for k, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
@@ -181,7 +183,7 @@ class RingNode(object):
             delay = max(replica[3] for replica in v)
             expired = any(replica[4] for replica in v)
             count = len(v)
-            print '{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
+            print('{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
                 start=start,
                 count=count,
                 hostname=hostname,
@@ -189,7 +191,7 @@ class RingNode(object):
                 delay=delay,
                 size=size,
                 extra=' (EXPIRED)' if expired else ''
-            )
+            ))
 
     def heartbeat(self):
         """
@@ -263,7 +265,7 @@ class RingNode(object):
         Returns a boolean indicating if this node is responsible for handling
         the given key.
         """
-        n = binascii.crc32(key) % RING_SIZE
+        n = binascii.crc32(key.encode()) % RING_SIZE
         for start, end in self.ranges:
             if start <= n < end:
                 return True
@@ -298,7 +300,7 @@ class RingNode(object):
             timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
             r, w, x = self._select([fileno], [], [], timeout)
             if fileno in r:
-                message = gen.next()
+                gen.next()
                 self.update()
 
             last_heartbeat = time.time()
