@@ -1,6 +1,8 @@
 ==============
 redis-hashring
 ==============
+.. image:: https://circleci.com/gh/closeio/redis-hashring.svg?style=svg&circle-token=e9b81f0e4bc9a1a0b6150522e854ca0c9b1c2881
+    :target: https://circleci.com/gh/closeio/redis-hashring/tree/master
 
 *redis-hashring* is a Python library that implements a consistent hash ring
 for building distributed applications, which is stored in Redis.
