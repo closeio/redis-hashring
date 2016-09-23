@@ -300,7 +300,7 @@ class RingNode(object):
             timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
             r, w, x = self._select([fileno], [], [], timeout)
             if fileno in r:
-                gen.next()
+                next(gen)
                 self.update()
 
             last_heartbeat = time.time()
