@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='redis-hashring',
-    version='0.1.1',
+    version='0.1.2',
     url='http://github.com/closeio/redis-hashring',
     license='MIT',
     description='Python library for distributed applications using a Redis hash ring',
