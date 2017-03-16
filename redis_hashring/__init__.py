@@ -294,13 +294,9 @@ class RingNode(object):
         self.cleanup()
 
         while True:
-            # Since Redis' listen method blocks, we use select to inspect the
-            # underlying socket to see if there is activity.
-            fileno = pubsub.connection._sock.fileno()
             timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-            r, w, x = self._select([fileno], [], [], timeout)
-            if fileno in r:
-                next(gen)
+            message = pubsub.get_message(timeout)
+            if message is not None:
                 self.update()
 
             last_heartbeat = time.time()
