@@ -9,6 +9,7 @@ import operator
 import os
 import select
 
+
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
 RING_SIZE = 2**32
@@ -24,6 +25,14 @@ NODE_TIMEOUT = 60
 
 # How often expired nodes are cleaned up from the ring
 CLEANUP_INTERVAL = 120
+
+
+def _decode(data):
+    # Compatibility with different redis-py decode_responses settings
+    if isinstance(data, bytes):
+        return data.decode()
+    else:
+        return data
 
 
 class RingNode(object):
@@ -99,7 +108,7 @@ class RingNode(object):
         ring = []
 
         for node_data in data:
-            start, replica = node_data.decode().split(':', 1)
+            start, replica = _decode(node_data).split(':', 1)
             ring.append((int(start), replica))
 
         ring = sorted(ring, key=operator.itemgetter(0))
@@ -125,7 +134,7 @@ class RingNode(object):
         ring = []
 
         for node_data, heartbeat in data:
-            start, replica = node_data.split(':', 1)
+            start, replica = _decode(node_data).split(':', 1)
             ring.append((int(start), replica, heartbeat, heartbeat < expiry_time))
 
         ring = sorted(ring, key=operator.itemgetter(0))
