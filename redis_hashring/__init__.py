@@ -293,23 +293,26 @@ class RingNode(object):
         last_cleanup = time.time()
         self.cleanup()
 
-        while True:
-            # Since Redis' listen method blocks, we use select to inspect the
-            # underlying socket to see if there is activity.
-            fileno = pubsub.connection._sock.fileno()
-            timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-            r, w, x = self._select([fileno], [], [], timeout)
-            if fileno in r:
-                next(gen)
-                self.update()
+        try:
+            while True:
+                # Since Redis' listen method blocks, we use select to inspect the
+                # underlying socket to see if there is activity.
+                fileno = pubsub.connection._sock.fileno()
+                timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
+                r, w, x = self._select([fileno], [], [], timeout)
+                if fileno in r:
+                    next(gen)
+                    self.update()
 
-            last_heartbeat = time.time()
-            self.heartbeat()
+                last_heartbeat = time.time()
+                self.heartbeat()
 
-            now = time.time()
-            if now - last_cleanup > CLEANUP_INTERVAL:
-                last_cleanup = now
-                self.cleanup()
+                now = time.time()
+                if now - last_cleanup > CLEANUP_INTERVAL:
+                    last_cleanup = now
+                    self.cleanup()
+        finally:
+            pubsub.close()
 
     def gevent_start(self):
         """
