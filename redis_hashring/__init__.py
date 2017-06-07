@@ -304,7 +304,7 @@ class RingNode(object):
 
         while True:
             timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-            message = pubsub.get_message(timeout=timeout)
+            message = pubsub.get_message(True, timeout)
             if message is not None:
                 self.update()
 
