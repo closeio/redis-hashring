@@ -7,7 +7,6 @@ import time
 import random
 import operator
 import os
-import select
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
@@ -82,8 +81,6 @@ class RingNode(object):
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
         self.ranges = []
-
-        self._select = select.select
 
     def _fetch(self):
         """
@@ -284,9 +281,6 @@ class RingNode(object):
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
 
-        # Pubsub messages generator
-        gen = pubsub.listen()
-
         last_heartbeat = time.time()
         self.heartbeat()
 
@@ -295,13 +289,13 @@ class RingNode(object):
 
         try:
             while True:
-                # Since Redis' listen method blocks, we use select to inspect the
-                # underlying socket to see if there is activity.
-                fileno = pubsub.connection._sock.fileno()
+
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-                r, w, x = self._select([fileno], [], [], timeout)
-                if fileno in r:
-                    next(gen)
+                message = pubsub.get_message(timeout=timeout)
+                if message:
+                    # Pull remaining messages off of channel
+                    while pubsub.get_message():
+                        pass
                     self.update()
 
                 last_heartbeat = time.time()
@@ -319,9 +313,7 @@ class RingNode(object):
         Helper method to start the node for gevent-based applications.
         """
         import gevent
-        import gevent.select
         self._poller_greenlet = gevent.spawn(self.poll)
-        self._select = gevent.select.select
         self.heartbeat()
         self.update()
 
@@ -332,4 +324,3 @@ class RingNode(object):
         import gevent
         gevent.kill(self._poller_greenlet)
         self.remove()
-        self._select = select.select
