@@ -1,0 +1,28 @@
+version: 2
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - test-2.7
+      - test-3.5
+
+defaults: &defaults
+  working_directory: ~/code
+  steps:
+  - checkout
+  - run:
+      name: Test
+      command: python setup.py test
+
+jobs:
+  test-2.7:
+    <<: *defaults
+    docker:
+    - image: circleci/python:2.7
+    - image: redis:3
+  test-3.5:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.5
+    - image: redis:3
