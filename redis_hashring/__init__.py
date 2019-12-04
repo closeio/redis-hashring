@@ -265,7 +265,17 @@ class RingNode(object):
         Returns a boolean indicating if this node is responsible for handling
         the given key.
         """
-        n = binascii.crc32(key.encode()) % RING_SIZE
+        return self.contains_ring_point(self.key_as_ring_point(key))
+
+    def key_as_ring_point(self, key):
+        """Turn a key into a point on a hash ring."""
+        return binascii.crc32(key.encode()) % RING_SIZE
+
+    def contains_ring_point(self, n):
+        """
+        Returns a boolean indicating if this node is responsible for handling
+        the given point on a hash ring.
+        """
         for start, end in self.ranges:
             if start <= n < end:
                 return True
