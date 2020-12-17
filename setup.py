@@ -7,7 +7,7 @@ setup(
     license='MIT',
     description='Python library for distributed applications using a Redis hash ring',
     test_suite='tests',
-    tests_require=['redis==2.10.6'],
+    tests_require=['redis>=3'],
     platforms='any',
     classifiers=[
         'Intended Audience :: Developers',

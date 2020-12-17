@@ -201,10 +201,10 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
         now = time.time()
         for replica in self.replicas:
-            pipeline.zadd(self.key, '{start}:{name}'.format(
+            pipeline.zadd(self.key, {'{start}:{name}'.format(
                 start=replica[0],
                 name=replica[1]
-            ), now)
+            ): now})
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
