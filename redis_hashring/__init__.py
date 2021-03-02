@@ -11,7 +11,7 @@ import select
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
-RING_SIZE = 2**32
+RING_SIZE = 2 ** 32
 
 # Default amount of replicas per node
 RING_REPLICAS = 16
@@ -70,14 +70,15 @@ class RingNode(object):
         host = socket.gethostname()
         pid = os.getpid()
         # Create unique identifiers for the replicas
-        self.replicas = [(
-            random.randrange(2**32),
-            '{host}:{pid}:{rand}'.format(
-                host=host,
-                pid=pid,
-                rand=binascii.hexlify(os.urandom(4)).decode()
+        self.replicas = [
+            (
+                random.randrange(2 ** 32),
+                '{host}:{pid}:{rand}'.format(
+                    host=host, pid=pid, rand=binascii.hexlify(os.urandom(4)).decode()
+                ),
             )
-        ) for n in range(n_replicas)]
+            for n in range(n_replicas)
+        ]
 
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
@@ -154,44 +155,52 @@ class RingNode(object):
             hostname, pid, rnd = replica.split(':')
             node = ':'.join([hostname, pid])
 
-            abs_size = (ring[(n+1) % n_replicas][0] - ring[n][0]) % RING_SIZE
-            size = 100. / RING_SIZE * abs_size
+            abs_size = (ring[(n + 1) % n_replicas][0] - ring[n][0]) % RING_SIZE
+            size = 100.0 / RING_SIZE * abs_size
             delay = int(now - heartbeat)
 
             nodes[node].append((hostname, pid, abs_size, delay, expired))
 
-            print('{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
-                start=start,
-                replica=replica,
-                delay=delay,
-                size=size,
-                extra=' (EXPIRED)' if expired else ''
-            ))
+            print(
+                '{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
+                    start=start,
+                    replica=replica,
+                    delay=delay,
+                    size=size,
+                    extra=' (EXPIRED)' if expired else '',
+                )
+            )
 
         print()
         print('Hash ring "{key}" nodes:'.format(key=self.key))
 
         if nodes:
-            print('{:8} {:8} {:7} {:20} {:5}'.format('Range', 'Replicas', 'Delay', 'Hostname', 'PID'))
+            print(
+                '{:8} {:8} {:7} {:20} {:5}'.format(
+                    'Range', 'Replicas', 'Delay', 'Hostname', 'PID'
+                )
+            )
         else:
             print('(no nodes)')
 
         for k, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
             abs_size = sum(replica[2] for replica in v)
-            size = 100. / RING_SIZE * abs_size
+            size = 100.0 / RING_SIZE * abs_size
             delay = max(replica[3] for replica in v)
             expired = any(replica[4] for replica in v)
             count = len(v)
-            print('{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
-                start=start,
-                count=count,
-                hostname=hostname,
-                pid=pid,
-                delay=delay,
-                size=size,
-                extra=' (EXPIRED)' if expired else ''
-            ))
+            print(
+                '{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
+                    start=start,
+                    count=count,
+                    hostname=hostname,
+                    pid=pid,
+                    delay=delay,
+                    size=size,
+                    extra=' (EXPIRED)' if expired else '',
+                )
+            )
 
     def heartbeat(self):
         """
@@ -201,10 +210,12 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
         now = time.time()
         for replica in self.replicas:
-            pipeline.zadd(self.key, '{start}:{name}'.format(
-                start=replica[0],
-                name=replica[1]
-            ), now)
+            pipeline.zadd(
+                self.key,
+                {
+                    '{start}:{name}'.format(start=replica[0], name=replica[1]): now,
+                },
+            )
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
@@ -217,10 +228,9 @@ class RingNode(object):
         """
         pipeline = self.conn.pipeline()
         for replica in self.replicas:
-            pipeline.zrem(self.key, '{start}:{name}'.format(
-                start=replica[0],
-                name=replica[1]
-            ))
+            pipeline.zrem(
+                self.key, '{start}:{name}'.format(start=replica[0], name=replica[1])
+            )
         pipeline.execute()
         self._notify()
 
@@ -251,7 +261,7 @@ class RingNode(object):
         self.ranges = []
         for n, (start, replica) in enumerate(ring):
             if replica in replica_set:
-                end = ring[(n+1) % n_replicas][0] % RING_SIZE
+                end = ring[(n + 1) % n_replicas][0] % RING_SIZE
                 if start < end:
                     self.ranges.append((start, end))
                 elif end < start:
@@ -330,6 +340,7 @@ class RingNode(object):
         """
         import gevent
         import gevent.select
+
         self._poller_greenlet = gevent.spawn(self.poll)
         self._select = gevent.select.select
         self.heartbeat()
@@ -340,6 +351,7 @@ class RingNode(object):
         Helper method to stop the node for gevent-based applications.
         """
         import gevent
+
         gevent.kill(self._poller_greenlet)
         self.remove()
         self._select = select.select

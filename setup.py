@@ -2,12 +2,15 @@ from setuptools import setup
 
 setup(
     name='redis-hashring',
-    version='0.1.3',
+    version='0.2.0',
+    author='Close Engineering',
+    author_email='engineering@close.com',
     url='http://github.com/closeio/redis-hashring',
     license='MIT',
-    description='Python library for distributed applications using a Redis hash ring',
-    test_suite='tests',
-    tests_require=['redis==2.10.6'],
+    description=(
+        'Python library for distributed applications using a Redis hash ring'
+    ),
+    install_requires=['redis>=3,<4'],
     platforms='any',
     classifiers=[
         'Intended Audience :: Developers',
@@ -15,10 +18,11 @@ setup(
         'Operating System :: OS Independent',
         'Topic :: Software Development :: Libraries :: Python Modules',
         'Programming Language :: Python',
-        'Programming Language :: Python :: 2',
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3 :: Only',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
     ],
     packages=[
         'redis_hashring',
