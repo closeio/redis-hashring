@@ -1,39 +1,43 @@
+import pytest
 from redis import Redis
-import unittest
 from redis_hashring import RingNode
 
 TEST_KEY = 'hashring-test'
 
-class HashRingTestCase(unittest.TestCase):
-    def setUp(self):
-        self.redis = Redis()
-        self.redis.delete(TEST_KEY)
 
-    def get_node(self, n_replicas, total_replicas):
-        node = RingNode(self.redis, TEST_KEY, n_replicas=n_replicas)
+@pytest.fixture
+def redis():
+    redis = Redis()
+    yield redis
+    redis.delete(TEST_KEY)
 
-        self.assertEqual(len(node.replicas), n_replicas)
-        self.assertEqual(self.redis.zcard(TEST_KEY), total_replicas-n_replicas)
 
-        node.heartbeat()
+def get_node(redis, n_replicas, total_replicas):
+    node = RingNode(redis, TEST_KEY, n_replicas=n_replicas)
 
-        self.assertEqual(self.redis.zcard(TEST_KEY), total_replicas)
-        self.assertEqual(len(node.ranges), 0)
+    assert len(node.replicas) == n_replicas
+    assert redis.zcard(TEST_KEY) == total_replicas - n_replicas
 
-        return node
+    node.heartbeat()
 
-    def test_node(self):
-        node1 = self.get_node(1, 1)
-        node1.update()
-        self.assertEqual(len(node1.ranges), 1)
+    assert redis.zcard(TEST_KEY) == total_replicas
+    assert len(node.ranges) == 0
 
-        node2 = self.get_node(1, 2)
-        node1.update()
-        node2.update()
-        self.assertEqual(len(node1.ranges) + len(node2.ranges), 3)
+    return node
 
-        node3 = self.get_node(2, 4)
-        node1.update()
-        node2.update()
-        node3.update()
-        self.assertEqual(len(node1.ranges) + len(node2.ranges) + len(node3.ranges), 5)
+
+def test_node(redis):
+    node1 = get_node(redis, 1, 1)
+    node1.update()
+    assert len(node1.ranges) == 1
+
+    node2 = get_node(redis, 1, 2)
+    node1.update()
+    node2.update()
+    assert len(node1.ranges) + len(node2.ranges) == 3
+
+    node3 = get_node(redis, 2, 4)
+    node1.update()
+    node2.update()
+    node3.update()
+    assert len(node1.ranges) + len(node2.ranges) + len(node3.ranges) == 5

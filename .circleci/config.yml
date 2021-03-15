@@ -1,0 +1,37 @@
+version: 2
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - test-3.6
+      - test-3.7
+      - test-3.8
+
+defaults: &defaults
+  working_directory: ~/code
+  steps:
+  - checkout
+  - run:
+      name: Install dependencies
+      command: pip install --user -r requirements.txt
+  - run:
+      name: Test
+      command: pytest tests.py
+
+jobs:
+  test-3.6:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.6
+    - image: redis:6.2.0
+  test-3.7:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.7
+    - image: redis:6.2.0
+  test-3.8:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.8
+    - image: redis:6.2.0
