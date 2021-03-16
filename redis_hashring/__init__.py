@@ -308,9 +308,6 @@ class RingNode(object):
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
 
-        # Pubsub messages generator
-        gen = pubsub.listen()
-
         last_heartbeat = time.time()
         self.heartbeat()
 
