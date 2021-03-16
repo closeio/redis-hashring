@@ -5,7 +5,6 @@ import time
 import random
 import operator
 import os
-import select
 
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
@@ -90,8 +89,6 @@ class RingNode(object):
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
         self.ranges = []
-
-        self._select = select.select
 
     def _fetch(self):
         """
@@ -344,10 +341,8 @@ class RingNode(object):
         Helper method to start the node for gevent-based applications.
         """
         import gevent
-        import gevent.select
 
         self._poller_greenlet = gevent.spawn(self.poll)
-        self._select = gevent.select.select
         self.heartbeat()
         self.update()
 
@@ -359,4 +354,3 @@ class RingNode(object):
 
         gevent.kill(self._poller_greenlet)
         self.remove()
-        self._select = select.select
