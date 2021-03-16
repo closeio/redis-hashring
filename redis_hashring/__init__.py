@@ -320,7 +320,10 @@ class RingNode(object):
                 message = pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=timeout
                 )
-                if message is not None:
+                if message:
+                    # Pull remaining messages off of channel.
+                    while pubsub.get_message():
+                        pass
                     self.update()
 
                 last_heartbeat = time.time()
