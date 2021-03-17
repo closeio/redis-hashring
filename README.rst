@@ -181,6 +181,10 @@ An example app could look as follows:
 
 .. code:: python
 
+  import gevent.monkey
+
+  gevent.monkey.patch_all()
+
   from redis import Redis
   from redis_hashring import RingNode
 
