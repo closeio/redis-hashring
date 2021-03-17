@@ -171,7 +171,13 @@ gevent example
 *redis-hashring* provides a ``RingNode`` class, which has helper methods for
 `gevent`-based applications. The ``RingNode.gevent_start()`` method spawns a
 greenlet that initializes the ring and periodically updates the node's
-replicas. An example app could look as follows:
+replicas.
+
+To use with `gevent`, make sure to have called `gevent.monkey.patch_all()`
+*before* importing *redis* and *redis-hashring* for the first time in the
+process.
+
+An example app could look as follows:
 
 .. code:: python
 
