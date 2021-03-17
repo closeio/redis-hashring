@@ -173,8 +173,8 @@ gevent example
 greenlet that initializes the ring and periodically updates the node's
 replicas.
 
-To use with `gevent`, make sure to have called `gevent.monkey.patch_all()`
-*before* importing *redis* and *redis-hashring* for the first time in the
+To use with ``gevent``, make sure to have called ``gevent.monkey.patch_all()``
+*before* importing ``redis`` and ``redis-hashring`` for the first time in the
 process.
 
 An example app could look as follows:
