@@ -297,6 +297,16 @@ class RingNode(object):
                 return True
         return False
 
+    def _drain_pubsub_channel(self, pubsub_gen, fileno):
+        """
+        Drain the pubsub channel completely to avoid unnecessary updates.
+        """
+        next(pubsub_gen)
+        r, w, x = self._select([fileno], [], [], 0)
+        while fileno in r:
+            next(pubsub_gen)
+            r, w, x = self._select([fileno], [], [], 0)
+
     def poll(self):
         """
         Main loop which maintains the node in the hash ring. Can be run in a
@@ -327,7 +337,7 @@ class RingNode(object):
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
                 r, w, x = self._select([fileno], [], [], timeout)
                 if fileno in r:
-                    next(gen)
+                    self._drain_pubsub_channel(gen, fileno)
                     self.update()
 
                 last_heartbeat = time.time()
