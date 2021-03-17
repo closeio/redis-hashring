@@ -1,7 +1,6 @@
 import pytest
 from redis import Redis
 from redis_hashring import RingNode
-import select
 
 TEST_KEY = 'hashring-test'
 
@@ -42,19 +41,3 @@ def test_node(redis):
     node2.update()
     node3.update()
     assert len(node1.ranges) + len(node2.ranges) + len(node3.ranges) == 5
-
-
-def test_drain_pubsub_channel(redis):
-    node = RingNode(redis, TEST_KEY, n_replicas=1)
-
-    pubsub = redis.pubsub()
-    pubsub.subscribe(node.key)
-    gen = pubsub.listen()
-
-    redis.publish(node.key, '*')
-    redis.publish(node.key, '*')
-
-    fileno = pubsub.connection._sock.fileno()
-    assert select.select([fileno], [], [], 0)[0] == [fileno]
-    node._drain_pubsub_channel(gen, fileno)
-    assert select.select([fileno], [], [], 0)[0] == []
