@@ -6,7 +6,6 @@ import random
 import operator
 import os
 
-
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
 RING_SIZE = 2 ** 32
@@ -61,7 +60,6 @@ class RingNode(object):
 
     node.gevent_stop()
     ```
-
     """
 
     def __init__(self, conn, key, n_replicas=RING_REPLICAS):
