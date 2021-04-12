@@ -293,7 +293,7 @@ class RingNode(object):
                 return True
         return False
 
-    def poll(self):
+    def poll(self, as_greenlet=False):
         """
         Main loop which maintains the node in the hash ring. Can be run in a
         greenlet or separate thread. This takes care of:
@@ -304,6 +304,12 @@ class RingNode(object):
         """
 
         pubsub = self.conn.pubsub()
+        if as_greenlet:
+            import gevent.socket
+            pubsub.connection._sock = gevent.socket.socket(
+                fileno=pubsub.connection._sock.fileno()
+            )
+
         pubsub.subscribe(self.key)
 
         last_heartbeat = time.time()
@@ -340,7 +346,7 @@ class RingNode(object):
         """
         import gevent
 
-        self._poller_greenlet = gevent.spawn(self.poll)
+        self._poller_greenlet = gevent.spawn(self.poll, as_greenlet=True)
         self.heartbeat()
         self.update()
 
