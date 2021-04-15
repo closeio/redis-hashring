@@ -5,6 +5,7 @@ import time
 import random
 import operator
 import os
+import select
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
@@ -87,6 +88,8 @@ class RingNode(object):
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
         self.ranges = []
+
+        self._select = select.select
 
     def _fetch(self):
         """
@@ -293,7 +296,7 @@ class RingNode(object):
                 return True
         return False
 
-    def poll(self, as_greenlet=False):
+    def poll(self):
         """
         Main loop which maintains the node in the hash ring. Can be run in a
         greenlet or separate thread. This takes care of:
@@ -304,12 +307,6 @@ class RingNode(object):
         """
 
         pubsub = self.conn.pubsub()
-        if as_greenlet:
-            import gevent.socket
-            pubsub.connection._sock = gevent.socket.socket(
-                fileno=pubsub.connection._sock.fileno()
-            )
-
         pubsub.subscribe(self.key)
 
         last_heartbeat = time.time()
@@ -320,12 +317,12 @@ class RingNode(object):
 
         try:
             while True:
+                # Since Redis' listen method blocks, we use select to inspect the
+                # underlying socket to see if there is activity.
+                fileno = pubsub.connection._sock.fileno()
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-                message = pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=timeout
-                )
-                if message:
-                    # Pull remaining messages off of channel.
+                r, w, x = self._select([fileno], [], [], timeout)
+                if fileno in r:
                     while pubsub.get_message():
                         pass
                     self.update()
@@ -345,8 +342,10 @@ class RingNode(object):
         Helper method to start the node for gevent-based applications.
         """
         import gevent
+        import gevent.select
 
-        self._poller_greenlet = gevent.spawn(self.poll, as_greenlet=True)
+        self._select = gevent.select.select
+        self._poller_greenlet = gevent.spawn(self.poll)
         self.heartbeat()
         self.update()
 
@@ -358,3 +357,4 @@ class RingNode(object):
 
         gevent.kill(self._poller_greenlet)
         self.remove()
+        self._select = select.select
