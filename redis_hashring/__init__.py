@@ -344,8 +344,8 @@ class RingNode(object):
         import gevent
         import gevent.select
 
-        self._poller_greenlet = gevent.spawn(self.poll)
         self._select = gevent.select.select
+        self._poller_greenlet = gevent.spawn(self.poll)
         self.heartbeat()
         self.update()
 
