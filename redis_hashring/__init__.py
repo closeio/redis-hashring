@@ -309,9 +309,6 @@ class RingNode(object):
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
 
-        # Pubsub messages generator
-        gen = pubsub.listen()
-
         last_heartbeat = time.time()
         self.heartbeat()
 
@@ -326,7 +323,8 @@ class RingNode(object):
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
                 r, w, x = self._select([fileno], [], [], timeout)
                 if fileno in r:
-                    next(gen)
+                    while pubsub.get_message():
+                        pass
                     self.update()
 
                 last_heartbeat = time.time()
