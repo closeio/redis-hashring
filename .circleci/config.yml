@@ -4,9 +4,9 @@ workflows:
   version: 2
   workflow:
     jobs:
-      - test-3.6
-      - test-3.7
       - test-3.8
+      - test-3.9
+      - test-3.10
 
 defaults: &defaults
   working_directory: ~/code
@@ -20,18 +20,18 @@ defaults: &defaults
       command: pytest tests.py
 
 jobs:
-  test-3.6:
-    <<: *defaults
-    docker:
-    - image: circleci/python:3.6
-    - image: redis:6.2.0
-  test-3.7:
-    <<: *defaults
-    docker:
-    - image: circleci/python:3.7
-    - image: redis:6.2.0
   test-3.8:
     <<: *defaults
     docker:
     - image: circleci/python:3.8
+    - image: redis:6.2.0
+  test-3.9:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.9
+    - image: redis:6.2.0
+  test-3.10:
+    <<: *defaults
+    docker:
+    - image: circleci/python:3.10
     - image: redis:6.2.0
