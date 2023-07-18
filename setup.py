@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='redis-hashring',
-    version='0.3.2',
+    version='0.3.3',
     author='Close Engineering',
     author_email='engineering@close.com',
     url='http://github.com/closeio/redis-hashring',
