@@ -6,6 +6,7 @@ import random
 import operator
 import os
 import select
+import threading
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
@@ -48,6 +49,20 @@ class RingNode(object):
     Represents a pubsub channel in Redis which receives a message every
     time the ring structure has changed.
 
+    Simple usage example for a distributed threads-based application:
+
+    ```
+    node = RingNode(redis, key)
+    node.start()
+
+    while is_running:
+        # Only process items this node is responsible for.
+        items = [item for item in get_items() if node.contains(item)]
+        process_items(items)
+
+    node.stop()
+    ```
+
     Simple usage example for a distributed gevent-based application:
 
     ```
@@ -55,7 +70,7 @@ class RingNode(object):
     node.gevent_start()
 
     while is_running:
-        # Only process items this node is reponsible for.
+        # Only process items this node is responsible for.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 
@@ -68,6 +83,10 @@ class RingNode(object):
         Initializes a Redis hash ring node, given the Redis connection, a key
         and the number of replicas.
         """
+        self._polling_thread = None
+        self._polling_greenlet = None
+        self._stop_polling_fd_r = None
+        self._stop_polling_fd_w = None
 
         self.conn = conn
         self.key = key
@@ -122,7 +141,6 @@ class RingNode(object):
         * heartbeat: unix time stamp of the last heartbeat
         * expired: boolean denoting whether this replica is inactive
         """
-
         now = time.time()
         expiry_time = now - NODE_TIMEOUT
 
@@ -142,7 +160,6 @@ class RingNode(object):
         """
         Prints the ring for debugging purposes.
         """
-
         ring = self._fetch_all()
 
         print('Hash ring "{key}" replicas:'.format(key=self.key))
@@ -305,7 +322,6 @@ class RingNode(object):
         * Checking for ring updates
         * Cleaning up expired nodes periodically
         """
-
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
 
@@ -315,14 +331,22 @@ class RingNode(object):
         last_cleanup = time.time()
         self.cleanup()
 
+        self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
+
         try:
             while True:
                 # Since Redis' listen method blocks, we use select to inspect the
                 # underlying socket to see if there is activity.
-                fileno = pubsub.connection._sock.fileno()
+                pubsub_fd = pubsub.connection._sock.fileno()
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-                r, w, x = self._select([fileno], [], [], timeout)
-                if fileno in r:
+                r, w, x = self._select([self._stop_polling_fd_r, pubsub_fd], [], [], timeout)
+                if self._stop_polling_fd_r in r:
+                    os.close(self._stop_polling_fd_r)
+                    os.close(self._stop_polling_fd_w)
+                    self._stop_polling_fd_r = None
+                    self._stop_polling_fd_w = None
+                    break
+                if pubsub_fd in r:
                     while pubsub.get_message():
                         pass
                     self.update()
@@ -337,6 +361,26 @@ class RingNode(object):
         finally:
             pubsub.close()
 
+    def start(self):
+        """
+        Helper method to start the node for threads-based applications.
+        """
+        self._polling_thread = threading.Thread(target=self.poll, daemon=True)
+        self._polling_thread.start()
+
+    def stop(self):
+        """
+        Helper method to stop the node for threads-based applications.
+        """
+        if self._polling_thread:
+            while not self._stop_polling_fd_w:
+                # Let's give the thread some time to create the fd.
+                time.sleep(0.1)
+            os.write(self._stop_polling_fd_w, b'1')
+            self._polling_thread.join()
+            self._polling_thread = None
+        self.remove()
+
     def gevent_start(self):
         """
         Helper method to start the node for gevent-based applications.
@@ -345,7 +389,7 @@ class RingNode(object):
         import gevent.select
 
         self._select = gevent.select.select
-        self._poller_greenlet = gevent.spawn(self.poll)
+        self._polling_greenlet = gevent.spawn(self.poll)
         self.heartbeat()
         self.update()
 
@@ -355,6 +399,12 @@ class RingNode(object):
         """
         import gevent
 
-        gevent.kill(self._poller_greenlet)
+        if self._polling_greenlet:
+            while not self._stop_polling_fd_w:
+                # Let's give the greenlet some time to create the fd.
+                time.sleep(0.1)
+            os.write(self._stop_polling_fd_w, b'1')
+            self._polling_greenlet.join()
+            self._polling_greenlet = None
         self.remove()
         self._select = select.select
