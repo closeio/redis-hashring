@@ -48,6 +48,20 @@ class RingNode(object):
     Represents a pubsub channel in Redis which receives a message every
     time the ring structure has changed.
 
+    Simple usage example for a distributed threads-based application:
+
+    ```
+    node = RingNode(redis, key)
+    node.start()
+
+    while is_running:
+        # Only process items this node is responsible for.
+        items = [item for item in get_items() if node.contains(item)]
+        process_items(items)
+
+    node.stop()
+    ```
+
     Simple usage example for a distributed gevent-based application:
 
     ```
@@ -55,7 +69,7 @@ class RingNode(object):
     node.gevent_start()
 
     while is_running:
-        # Only process items this node is reponsible for.
+        # Only process items this node is responsible for.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 
@@ -68,6 +82,8 @@ class RingNode(object):
         Initializes a Redis hash ring node, given the Redis connection, a key
         and the number of replicas.
         """
+        self._polling_thread = None
+        self._is_poll_running = False
 
         self.conn = conn
         self.key = key
@@ -122,7 +138,6 @@ class RingNode(object):
         * heartbeat: unix time stamp of the last heartbeat
         * expired: boolean denoting whether this replica is inactive
         """
-
         now = time.time()
         expiry_time = now - NODE_TIMEOUT
 
@@ -142,7 +157,6 @@ class RingNode(object):
         """
         Prints the ring for debugging purposes.
         """
-
         ring = self._fetch_all()
 
         print('Hash ring "{key}" replicas:'.format(key=self.key))
@@ -305,7 +319,6 @@ class RingNode(object):
         * Checking for ring updates
         * Cleaning up expired nodes periodically
         """
-
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
 
@@ -315,8 +328,10 @@ class RingNode(object):
         last_cleanup = time.time()
         self.cleanup()
 
+        self._is_poll_running = True
+
         try:
-            while True:
+            while self._is_poll_running:
                 # Since Redis' listen method blocks, we use select to inspect the
                 # underlying socket to see if there is activity.
                 fileno = pubsub.connection._sock.fileno()
@@ -337,6 +352,21 @@ class RingNode(object):
         finally:
             pubsub.close()
 
+    def start(self):
+        """
+        Helper method to start the node for threads-based applications.
+        """
+        self._polling_thread = threading.Thread(target=self.poll, daemon=True)
+        self._polling_thread.start()
+
+    def stop(self):
+        """
+        Helper method to stop the node for threads-based applications.
+        """
+        self._is_poll_running = False
+        self._polling_thread.join()
+        self.remove()
+
     def gevent_start(self):
         """
         Helper method to start the node for gevent-based applications.
@@ -355,6 +385,7 @@ class RingNode(object):
         """
         import gevent
 
-        gevent.kill(self._poller_greenlet)
+        self._is_poll_running = False
+        self._poller_greenlet.join()
         self.remove()
         self._select = select.select
