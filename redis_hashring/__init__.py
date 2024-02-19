@@ -6,6 +6,7 @@ import random
 import operator
 import os
 import select
+import threading
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
@@ -83,7 +84,9 @@ class RingNode(object):
         and the number of replicas.
         """
         self._polling_thread = None
-        self._is_poll_running = False
+        self._polling_greenlet = None
+        self._stop_polling_fd_r = None
+        self._stop_polling_fd_w = None
 
         self.conn = conn
         self.key = key
@@ -328,16 +331,20 @@ class RingNode(object):
         last_cleanup = time.time()
         self.cleanup()
 
-        self._is_poll_running = True
+        self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
 
         try:
-            while self._is_poll_running:
+            while True:
                 # Since Redis' listen method blocks, we use select to inspect the
                 # underlying socket to see if there is activity.
-                fileno = pubsub.connection._sock.fileno()
+                pubsub_fd = pubsub.connection._sock.fileno()
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-                r, w, x = self._select([fileno], [], [], timeout)
-                if fileno in r:
+                r, w, x = self._select([self._stop_polling_fd_r, pubsub_fd], [], [], timeout)
+                if self._stop_polling_fd_r in r:
+                    self._stop_polling_fd_r = None
+                    self._stop_polling_fd_w = None
+                    break
+                if pubsub_fd in r:
                     while pubsub.get_message():
                         pass
                     self.update()
@@ -363,8 +370,13 @@ class RingNode(object):
         """
         Helper method to stop the node for threads-based applications.
         """
-        self._is_poll_running = False
-        self._polling_thread.join()
+        if self._polling_thread:
+            while not self._stop_polling_fd_w:
+                # Let's give the thread some time to create the fd.
+                time.sleep(0.1)
+            os.write(self._stop_polling_fd_w, b'1')
+            self._polling_thread.join()
+            self._polling_thread = None
         self.remove()
 
     def gevent_start(self):
@@ -375,7 +387,7 @@ class RingNode(object):
         import gevent.select
 
         self._select = gevent.select.select
-        self._poller_greenlet = gevent.spawn(self.poll)
+        self._polling_greenlet = gevent.spawn(self.poll)
         self.heartbeat()
         self.update()
 
@@ -385,7 +397,12 @@ class RingNode(object):
         """
         import gevent
 
-        self._is_poll_running = False
-        self._poller_greenlet.join()
+        if self._polling_greenlet:
+            while not self._stop_polling_fd_w:
+                # Let's give the greenlet some time to create the fd.
+                time.sleep(0.1)
+            os.write(self._stop_polling_fd_w, b'1')
+            self._polling_greenlet.join()
+            self._polling_greenlet = None
         self.remove()
         self._select = select.select
