@@ -341,6 +341,8 @@ class RingNode(object):
                 timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
                 r, w, x = self._select([self._stop_polling_fd_r, pubsub_fd], [], [], timeout)
                 if self._stop_polling_fd_r in r:
+                    os.close(self._stop_polling_fd_r)
+                    os.close(self._stop_polling_fd_w)
                     self._stop_polling_fd_r = None
                     self._stop_polling_fd_w = None
                     break
