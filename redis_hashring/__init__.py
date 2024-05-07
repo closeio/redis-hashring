@@ -249,6 +249,10 @@ class RingNode(object):
             pipeline.zrem(self.key, f"{replica[0]}:{replica[1]}")
         pipeline.execute()
 
+        # Make sure this node won't contain any items.
+        self.node_count = 0
+        self.ranges = []
+
         self._notify()
 
     def _notify(self):

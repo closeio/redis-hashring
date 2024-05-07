@@ -54,3 +54,12 @@ def test_node(redis):
     assert node1.get_node_count() == 3
     assert node2.get_node_count() == 3
     assert node3.get_node_count() == 3
+
+    node1.remove()
+    node2.update()
+    node3.update()
+    assert len(node1.ranges) == 0
+    assert node1.get_node_count() == 0
+    assert len(node2.ranges) + len(node3.ranges) == 4
+    assert node2.get_node_count() == 2
+    assert node3.get_node_count() == 2
