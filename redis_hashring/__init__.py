@@ -115,6 +115,8 @@ class RingNode(object):
             for _ in range(n_replicas)
         ]
 
+        # Number of nodes currently active in the ring.
+        self.node_count = 0
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
         self.ranges = []
@@ -269,12 +271,17 @@ class RingNode(object):
         Fetches the updated ring from Redis and updates the current ranges.
         """
         ring = self._fetch_ring()
+        nodes = set()
         n_replicas = len(ring)
 
         own_replicas = {r[1] for r in self.replicas}
 
         self.ranges = []
         for n, (start, replica) in enumerate(ring):
+            host, pid, _ = replica.split(":")
+            node = ":".join([host, pid])
+            nodes.add(node)
+
             if replica in own_replicas:
                 end = ring[(n + 1) % n_replicas][0] % RING_SIZE
                 if start < end:
@@ -284,6 +291,14 @@ class RingNode(object):
                     self.ranges.append((0, end))
                 else:
                     self.ranges.append((0, RING_SIZE))
+
+        self.node_count = len(nodes)
+
+    def get_node_count(self):
+        """
+        Return the number of active nodes in the ring.
+        """
+        return self.node_count
 
     def contains(self, key):
         """

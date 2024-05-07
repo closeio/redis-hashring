@@ -1,3 +1,6 @@
+import socket
+from unittest.mock import patch
+
 import pytest
 from redis import Redis
 
@@ -28,17 +31,26 @@ def get_node(redis, n_replicas, total_replicas):
 
 
 def test_node(redis):
-    node1 = get_node(redis, 1, 1)
+    with patch.object(socket, "gethostname", return_value="host1"):
+        node1 = get_node(redis, 1, 1)
     node1.update()
     assert len(node1.ranges) == 1
+    assert node1.get_node_count() == 1
 
-    node2 = get_node(redis, 1, 2)
+    with patch.object(socket, "gethostname", return_value="host2"):
+        node2 = get_node(redis, 1, 2)
     node1.update()
     node2.update()
     assert len(node1.ranges) + len(node2.ranges) == 3
+    assert node1.get_node_count() == 2
+    assert node2.get_node_count() == 2
 
-    node3 = get_node(redis, 2, 4)
+    with patch.object(socket, "gethostname", return_value="host3"):
+        node3 = get_node(redis, 2, 4)
     node1.update()
     node2.update()
     node3.update()
     assert len(node1.ranges) + len(node2.ranges) + len(node3.ranges) == 5
+    assert node1.get_node_count() == 3
+    assert node2.get_node_count() == 3
+    assert node3.get_node_count() == 3
