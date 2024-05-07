@@ -1,16 +1,16 @@
 import binascii
 import collections
-import socket
-import time
-import random
 import operator
 import os
+import random
 import select
+import socket
 import threading
+import time
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
-RING_SIZE = 2 ** 32
+RING_SIZE = 2**32
 
 # Default amount of replicas per node.
 RING_REPLICAS = 16
@@ -105,11 +105,11 @@ class RingNode(object):
         # Create unique identifiers for the replicas.
         self.replicas = [
             (
-                random.randrange(2 ** 32),
-                '{host}:{pid}:{id_}'.format(
+                random.randrange(2**32),
+                "{host}:{pid}:{id_}".format(
                     host=host,
                     pid=pid,
-                    id_=binascii.hexlify(os.urandom(4)).decode()
+                    id_=binascii.hexlify(os.urandom(4)).decode(),
                 ),
             )
             for _ in range(n_replicas)
@@ -129,11 +129,11 @@ class RingNode(object):
         (start, replica) (see _fetch_all docs for more details).
         """
         expiry_time = time.time() - NODE_TIMEOUT
-        data = self.conn.zrangebyscore(self.key, expiry_time, 'INF')
+        data = self.conn.zrangebyscore(self.key, expiry_time, "INF")
 
         ring = []
         for replica_data in data:
-            start, replica = _decode(replica_data).split(':', 1)
+            start, replica = _decode(replica_data).split(":", 1)
             ring.append((int(start), replica))
         return sorted(ring, key=operator.itemgetter(0))
 
@@ -153,7 +153,7 @@ class RingNode(object):
 
         ring = []
         for replica_data, heartbeat in data:
-            start, replica = _decode(replica_data).split(':', 1)
+            start, replica = _decode(replica_data).split(":", 1)
             ring.append(
                 (int(start), replica, heartbeat, heartbeat < expiry_time)
             )
@@ -172,31 +172,26 @@ class RingNode(object):
         n_replicas = len(ring)
         if ring:
             print(
-                '{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node')
+                "{:10} {:6} {:7} {}".format("Start", "Range", "Delay", "Node")
             )
         else:
-            print('(no replicas)')
+            print("(no replicas)")
 
         nodes = collections.defaultdict(list)
 
         for n, (start, replica, heartbeat, expired) in enumerate(ring):
-            hostname, pid, id_ = replica.split(':')
-            node = ':'.join([hostname, pid])
+            hostname, pid, _ = replica.split(":")
+            node = ":".join([hostname, pid])
 
             abs_size = (ring[(n + 1) % n_replicas][0] - ring[n][0]) % RING_SIZE
             size = 100.0 / RING_SIZE * abs_size
             delay = int(now - heartbeat)
+            expired_str = "(EXPIRED)" if expired else ""
 
             nodes[node].append((hostname, pid, abs_size, delay, expired))
 
             print(
-                '{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
-                    start=start,
-                    replica=replica,
-                    delay=delay,
-                    size=size,
-                    extra=' (EXPIRED)' if expired else '',
-                )
+                f"{start:10} {size:5.2f}% {delay:6}s {replica} {expired_str}"
             )
 
         print()
@@ -204,12 +199,12 @@ class RingNode(object):
 
         if nodes:
             print(
-                '{:8} {:8} {:7} {:20} {:5}'.format(
-                    'Range', 'Replicas', 'Delay', 'Hostname', 'PID'
+                "{:8} {:8} {:7} {:20} {:5}".format(
+                    "Range", "Replicas", "Delay", "Hostname", "PID"
                 )
             )
         else:
-            print('(no nodes)')
+            print("(no nodes)")
 
         for k, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
@@ -218,10 +213,10 @@ class RingNode(object):
             delay = max(replica[3] for replica in v)
             expired = any(replica[4] for replica in v)
             count = len(v)
-            expired_str = '(EXPIRED)' if expired else ''
+            expired_str = "(EXPIRED)" if expired else ""
             print(
-                f'{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}'
-                f' {expired_str}'
+                f"{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}"
+                f" {expired_str}"
             )
 
     def heartbeat(self):
@@ -235,7 +230,7 @@ class RingNode(object):
         now = time.time()
 
         for replica in self.replicas:
-            pipeline.zadd(self.key, {f'{replica[0]}:{replica[1]}': now})
+            pipeline.zadd(self.key, {f"{replica[0]}:{replica[1]}": now})
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
@@ -249,7 +244,7 @@ class RingNode(object):
         pipeline = self.conn.pipeline()
 
         for replica in self.replicas:
-            pipeline.zrem(self.key, f'{replica[0]}:{replica[1]}')
+            pipeline.zrem(self.key, f"{replica[0]}:{replica[1]}")
         pipeline.execute()
 
         self._notify()
@@ -258,7 +253,7 @@ class RingNode(object):
         """
         Publish an update to the ring's activity channel.
         """
-        self.conn.publish(self.key, '*')
+        self.conn.publish(self.key, "*")
 
     def cleanup(self):
         """
@@ -339,7 +334,7 @@ class RingNode(object):
                 timeout = max(
                     0.0, POLL_INTERVAL - (time.time() - last_heartbeat)
                 )
-                r, w, x = self._select(
+                r, _, _ = self._select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
                 )
 
@@ -380,7 +375,7 @@ class RingNode(object):
             while not self._stop_polling_fd_w:
                 # Let's give the thread some time to create the fd.
                 time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b'1')
+            os.write(self._stop_polling_fd_w, b"1")
             self._polling_thread.join()
             self._polling_thread = None
         self.remove()
@@ -401,13 +396,11 @@ class RingNode(object):
         """
         Stop the node for gevent-based applications.
         """
-        import gevent
-
         if self._polling_greenlet:
             while not self._stop_polling_fd_w:
                 # Let's give the greenlet some time to create the fd.
                 time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b'1')
+            os.write(self._stop_polling_fd_w, b"1")
             self._polling_greenlet.join()
             self._polling_greenlet = None
         self.remove()

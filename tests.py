@@ -1,8 +1,9 @@
 import pytest
 from redis import Redis
+
 from redis_hashring import RingNode
 
-TEST_KEY = 'hashring-test'
+TEST_KEY = "hashring-test"
 
 
 @pytest.fixture

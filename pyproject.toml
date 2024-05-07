@@ -1,0 +1,94 @@
+[tool.black]
+skip-magic-trailing-comma = true
+target-version = ['py311']
+line-length = 79
+extend-exclude = '''
+/(
+      \.git
+    | venv
+    | \.venv
+    | __pycache__
+)/
+'''
+include = '''
+(
+      .*\.py$
+)
+'''
+
+[tool.ruff]
+target-version = "py311"
+line-length = 79
+exclude = [
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+]
+preview = true
+force-exclude = true
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+dummy-variable-rgx = "^__?$"
+unfixable = [
+    # Variable assigned but never used - automatically removing the assignment
+    # is annoying when running autofix on work-in-progress code.
+    "F841",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"functools.partial".msg = "Use a lambda or a named function instead. Partials don't type check correctly."
+"datetime.datetime.utcnow".msg = "Use `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)` instead."
+"datetime.datetime.utcfromtimestamp".msg = "Use `datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).replace(tzinfo=None)` instead."
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+# This is unreasonable, need to refactor and lower
+max-branches = 10
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+forced-separate = ["tests"]
+
+[tool.ruff.lint.pydocstyle]
+# https://google.github.io/styleguide/pyguide.html#383-functions-and-methods
+convention = "google"
+
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true
+
+[tool.pytest.ini_options]
+timeout = 180
+python_files = "tests/*.py"
+testpaths = ["closeio", "tests"]
+junit_family = "xunit1"
+xfail_strict = true
+
+[tool.coverage.run]
+# Makes coverage files more portable as otherwise
+# absolute paths differ inside and outside docker
+relative_files = true
+# Enable branch coverage statistics
+branch = true
+
+[tool.coverage.report]
+# Don't include files with no executable lines
+# such as empty __init__.py files
+skip_empty = true
+
+[tool.coverage.html]
+# Show contexts, in our case test files that
+# executed the code
+show_contexts = true
+
+[tool.typos.default]
+extend-ignore-re = [
+    # Don't check two-letter "words" - these are often abbreviations
+    "\\W\\w{1,2}\\W",
+]
