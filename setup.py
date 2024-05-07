@@ -10,7 +10,7 @@ setup(
     description=(
         'Python library for distributed applications using a Redis hash ring'
     ),
-    install_requires=['redis>=3,<5'],
+    install_requires=['redis>=3'],
     platforms='any',
     classifiers=[
         'Intended Audience :: Developers',
