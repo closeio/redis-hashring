@@ -5,7 +5,7 @@ setup(
     version='0.3.4',
     author='Close Engineering',
     author_email='engineering@close.com',
-    url='http://github.com/closeio/redis-hashring',
+    url='https://github.com/closeio/redis-hashring',
     license='MIT',
     description=(
         'Python library for distributed applications using a Redis hash ring'
