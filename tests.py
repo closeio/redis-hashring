@@ -54,3 +54,9 @@ def test_node(redis):
     assert node1.get_node_count() == 3
     assert node2.get_node_count() == 3
     assert node3.get_node_count() == 3
+
+
+def test_contains(redis):
+    node1 = get_node(redis, 1, 1)
+    node1.update()
+    assert node1.contains("item") is True
