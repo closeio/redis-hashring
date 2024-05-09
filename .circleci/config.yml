@@ -22,7 +22,7 @@ defaults: &defaults
       name: Test
       command: |
         export PATH=$HOME/.local/bin:$PATH
-        pytest tests.py
+        pytest
 
 jobs:
   lint:
@@ -35,20 +35,15 @@ jobs:
         name: Install dependencies
         command: pip install --user -r requirements.txt
     - run:
-        name: ruff
+        name: Format
         command: |
           export PATH=$HOME/.local/bin:$PATH
-          ruff check --no-cache .
+          ruff format --check --no-cache
     - run:
-        name: Black
+        name: Lint
         command: |
           export PATH=$HOME/.local/bin:$PATH
-          black --check .
-    - run:
-        name: isort
-        command: |
-          export PATH=$HOME/.local/bin:$PATH
-          isort --check .
+          ruff check --no-cache
   test-3.8:
     <<: *defaults
     docker:
