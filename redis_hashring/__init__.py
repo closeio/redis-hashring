@@ -97,13 +97,13 @@ class RingNode(object):
         self._stop_polling_fd_r = None
         self._stop_polling_fd_w = None
 
-        self.conn = conn
-        self.key = key
+        self._conn = conn
+        self._key = key
         host = socket.gethostname()
         pid = os.getpid()
 
         # Create unique identifiers for the replicas.
-        self.replicas = [
+        self._replicas = [
             (
                 random.randrange(2**32),
                 "{host}:{pid}:{id_}".format(
@@ -116,10 +116,10 @@ class RingNode(object):
         ]
 
         # Number of nodes currently active in the ring.
-        self.node_count = 0
+        self._node_count = 0
         # List of tuples of ranges this node is responsible for, where a tuple
         # (a, b) includes any N matching a <= N < b.
-        self.ranges = []
+        self._ranges = []
 
         self._select = select.select
 
@@ -131,7 +131,7 @@ class RingNode(object):
         (start, replica) (see _fetch_all docs for more details).
         """
         expiry_time = time.time() - NODE_TIMEOUT
-        data = self.conn.zrangebyscore(self.key, expiry_time, "INF")
+        data = self._conn.zrangebyscore(self._key, expiry_time, "INF")
 
         ring = []
         for replica_data in data:
@@ -151,7 +151,7 @@ class RingNode(object):
         * expired: boolean denoting whether this replica is inactive.
         """
         expiry_time = time.time() - NODE_TIMEOUT
-        data = self.conn.zrange(self.key, 0, -1, withscores=True)
+        data = self._conn.zrange(self._key, 0, -1, withscores=True)
 
         ring = []
         for replica_data, heartbeat in data:
@@ -167,7 +167,7 @@ class RingNode(object):
         """
         ring = self._fetch_ring_all()
 
-        print('Hash ring "{key}" replicas:'.format(key=self.key))
+        print('Hash ring "{key}" replicas:'.format(key=self._key))
 
         now = time.time()
 
@@ -197,7 +197,7 @@ class RingNode(object):
             )
 
         print()
-        print('Hash ring "{key}" nodes:'.format(key=self.key))
+        print('Hash ring "{key}" nodes:'.format(key=self._key))
 
         if nodes:
             print(
@@ -208,7 +208,7 @@ class RingNode(object):
         else:
             print("(no nodes)")
 
-        for k, v in nodes.items():
+        for _, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
             abs_size = sum(replica[2] for replica in v)
             size = 100.0 / RING_SIZE * abs_size
@@ -227,12 +227,12 @@ class RingNode(object):
 
         Needs to be called regularly by the node.
         """
-        pipeline = self.conn.pipeline()
+        pipeline = self._conn.pipeline()
 
         now = time.time()
 
-        for replica in self.replicas:
-            pipeline.zadd(self.key, {f"{replica[0]}:{replica[1]}": now})
+        for replica in self._replicas:
+            pipeline.zadd(self._key, {f"{replica[0]}:{replica[1]}": now})
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
@@ -243,10 +243,10 @@ class RingNode(object):
         """
         Remove the node from the ring.
         """
-        pipeline = self.conn.pipeline()
+        pipeline = self._conn.pipeline()
 
-        for replica in self.replicas:
-            pipeline.zrem(self.key, f"{replica[0]}:{replica[1]}")
+        for replica in self._replicas:
+            pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
         pipeline.execute()
 
         self._notify()
@@ -255,7 +255,7 @@ class RingNode(object):
         """
         Publish an update to the ring's activity channel.
         """
-        self.conn.publish(self.key, "*")
+        self._conn.publish(self._key, "*")
 
     def cleanup(self):
         """
@@ -263,7 +263,7 @@ class RingNode(object):
         """
         expired = time.time() - NODE_TIMEOUT
 
-        if self.conn.zremrangebyscore(self.key, 0, expired):
+        if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
 
     def update(self):
@@ -274,9 +274,9 @@ class RingNode(object):
         nodes = set()
         n_replicas = len(ring)
 
-        own_replicas = {r[1] for r in self.replicas}
+        own_replicas = {r[1] for r in self._replicas}
 
-        self.ranges = []
+        self._ranges = []
         for n, (start, replica) in enumerate(ring):
             host, pid, _ = replica.split(":")
             node = ":".join([host, pid])
@@ -285,26 +285,26 @@ class RingNode(object):
             if replica in own_replicas:
                 end = ring[(n + 1) % n_replicas][0] % RING_SIZE
                 if start < end:
-                    self.ranges.append((start, end))
+                    self._ranges.append((start, end))
                 elif end < start:
-                    self.ranges.append((start, RING_SIZE))
-                    self.ranges.append((0, end))
+                    self._ranges.append((start, RING_SIZE))
+                    self._ranges.append((0, end))
                 else:
-                    self.ranges.append((0, RING_SIZE))
+                    self._ranges.append((0, RING_SIZE))
 
-        self.node_count = len(nodes)
+        self._node_count = len(nodes)
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
         """
-        return self.node_count
+        return self._node_count
 
     def contains(self, key):
         """
         Check whether this node is responsible for the item.
         """
-        return self.contains_ring_point(self.key_as_ring_point(key))
+        return self.contains_ring_point(self._key_as_ring_point(key))
 
     def key_as_ring_point(self, key):
         """Turn a key into a point on a hash ring."""
@@ -314,7 +314,7 @@ class RingNode(object):
         """
         Check whether this node is responsible for the ring point.
         """
-        for start, end in self.ranges:
+        for start, end in self._ranges:
             if start <= n < end:
                 return True
         return False
@@ -330,8 +330,8 @@ class RingNode(object):
         * Checking for ring updates.
         * Cleaning up expired nodes periodically.
         """
-        pubsub = self.conn.pubsub()
-        pubsub.subscribe(self.key)
+        pubsub = self._conn.pubsub()
+        pubsub.subscribe(self._key)
         pubsub_fd = pubsub.connection._sock.fileno()
 
         last_heartbeat = time.time()
