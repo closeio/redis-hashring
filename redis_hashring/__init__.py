@@ -1,32 +1,32 @@
 import binascii
 import collections
-import socket
-import time
-import random
 import operator
 import os
+import random
 import select
+import socket
 import threading
+import time
 
 # Amount of points on the ring. Must not be higher than 2**32 because we're
 # using CRC32 to compute the checksum.
-RING_SIZE = 2 ** 32
+RING_SIZE = 2**32
 
-# Default amount of replicas per node
+# Default amount of replicas per node.
 RING_REPLICAS = 16
 
-# How often to update a node's heartbeat
+# How often to update a node's heartbeat.
 POLL_INTERVAL = 10
 
-# After how much time a node is considered to be dead
+# After how much time a node is considered to be dead.
 NODE_TIMEOUT = 60
 
-# How often expired nodes are cleaned up from the ring
+# How often expired nodes are cleaned up from the ring.
 CLEANUP_INTERVAL = 120
 
 
 def _decode(data):
-    # Compatibility with different redis-py decode_responses settings
+    # Compatibility with different redis-py `decode_responses` settings.
     if isinstance(data, bytes):
         return data.decode()
     else:
@@ -35,19 +35,20 @@ def _decode(data):
 
 class RingNode(object):
     """
-    Represents a node in a Redis hash ring. Each node may have multiple
-    replicas on the ring for more balanced hashing.
+    A node in a Redis hash ring.
+
+    Each node may have multiple replicas on the ring for more balanced hashing.
 
     The ring is stored as follows in Redis:
 
     ZSET <key>
     Represents the ring in Redis. The keys of this ZSET represent
-    "start:replica_name", where start is the start of the range for which
-    the replica is responsible.
+    "start:replica_name", where start is the start of the range for which the
+    replica is responsible.
 
     CHANNEL <key>
-    Represents a pubsub channel in Redis which receives a message every
-    time the ring structure has changed.
+    Represents a pubsub channel in Redis which receives a message every time
+    the ring structure has changed.
 
     Simple usage example for a distributed threads-based application:
 
@@ -56,7 +57,9 @@ class RingNode(object):
     node.start()
 
     while is_running:
-        # Only process items this node is responsible for.
+        # Only process items this node is responsible for. `item` should be an
+        # object that can be encoded to bytes by calling `item.encode()` on it,
+        # like a `str`.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 
@@ -70,7 +73,9 @@ class RingNode(object):
     node.gevent_start()
 
     while is_running:
-        # Only process items this node is responsible for.
+        # Only process items this node is responsible for. `item` should be an
+        # object that can be encoded to bytes by calling `item.encode()` on it,
+        # like a `str`.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 
@@ -80,8 +85,12 @@ class RingNode(object):
 
     def __init__(self, conn, key, n_replicas=RING_REPLICAS):
         """
-        Initializes a Redis hash ring node, given the Redis connection, a key
-        and the number of replicas.
+        Initializes a Redis hash ring node.
+
+        Args:
+            conn: The Redis connection to use.
+            key: A key to use for this node.
+            n_replicas: Number of replicas this node should have on the ring.
         """
         self._polling_thread = None
         self._polling_greenlet = None
@@ -90,18 +99,20 @@ class RingNode(object):
 
         self.conn = conn
         self.key = key
-
         host = socket.gethostname()
         pid = os.getpid()
-        # Create unique identifiers for the replicas
+
+        # Create unique identifiers for the replicas.
         self.replicas = [
             (
-                random.randrange(2 ** 32),
-                '{host}:{pid}:{rand}'.format(
-                    host=host, pid=pid, rand=binascii.hexlify(os.urandom(4)).decode()
+                random.randrange(2**32),
+                "{host}:{pid}:{id_}".format(
+                    host=host,
+                    pid=pid,
+                    id_=binascii.hexlify(os.urandom(4)).decode(),
                 ),
             )
-            for n in range(n_replicas)
+            for _ in range(n_replicas)
         ]
 
         # List of tuples of ranges this node is responsible for, where a tuple
@@ -110,87 +121,77 @@ class RingNode(object):
 
         self._select = select.select
 
-    def _fetch(self):
+    def _fetch_ring(self):
         """
-        Internal helper that fetches the ring from Redis, including only active
-        nodes/replicas. Returns a list of tuples (start, replica) (see
-        _fetch_all docs for more details).
-        """
-        now = time.time()
-        expiry_time = now - NODE_TIMEOUT
+        Fetch the ring from Redis.
 
-        data = self.conn.zrangebyscore(self.key, expiry_time, 'INF')
+        The fetched ring only includes active nodes. Returns a list of tuples
+        (start, replica) (see _fetch_all docs for more details).
+        """
+        expiry_time = time.time() - NODE_TIMEOUT
+        data = self.conn.zrangebyscore(self.key, expiry_time, "INF")
 
         ring = []
-
-        for node_data in data:
-            start, replica = _decode(node_data).split(':', 1)
+        for replica_data in data:
+            start, replica = _decode(replica_data).split(":", 1)
             ring.append((int(start), replica))
+        return sorted(ring, key=operator.itemgetter(0))
 
-        ring = sorted(ring, key=operator.itemgetter(0))
-
-        return ring
-
-    def _fetch_all(self):
+    def _fetch_ring_all(self):
         """
-        Internal helper that fetches the ring from Redis, including any
-        inactive nodes/replicas. Returns a list of tuples (start, replica,
-        heartbeat, expired), where
-        * start: start of the range for which the replica is responsible
-        * replica: name of the replica
-        * heartbeat: unix time stamp of the last heartbeat
-        * expired: boolean denoting whether this replica is inactive
-        """
-        now = time.time()
-        expiry_time = now - NODE_TIMEOUT
+        Fetch the ring from Redis.
 
+        The fetched ring will include inactive nodes. Returns a list of tuples
+        (start, replica, heartbeat, expired), where:
+        * start: start of the range for which the replica is responsible.
+        * replica: name of the replica.
+        * heartbeat: timestamp of the last heartbeat.
+        * expired: boolean denoting whether this replica is inactive.
+        """
+        expiry_time = time.time() - NODE_TIMEOUT
         data = self.conn.zrange(self.key, 0, -1, withscores=True)
 
         ring = []
-
-        for node_data, heartbeat in data:
-            start, replica = _decode(node_data).split(':', 1)
-            ring.append((int(start), replica, heartbeat, heartbeat < expiry_time))
-
-        ring = sorted(ring, key=operator.itemgetter(0))
-
-        return ring
+        for replica_data, heartbeat in data:
+            start, replica = _decode(replica_data).split(":", 1)
+            ring.append(
+                (int(start), replica, heartbeat, heartbeat < expiry_time)
+            )
+        return sorted(ring, key=operator.itemgetter(0))
 
     def debug_print(self):
         """
         Prints the ring for debugging purposes.
         """
-        ring = self._fetch_all()
+        ring = self._fetch_ring_all()
 
         print('Hash ring "{key}" replicas:'.format(key=self.key))
 
         now = time.time()
+
         n_replicas = len(ring)
         if ring:
-            print('{:10} {:6} {:7} {}'.format('Start', 'Range', 'Delay', 'Node'))
+            print(
+                "{:10} {:6} {:7} {}".format("Start", "Range", "Delay", "Node")
+            )
         else:
-            print('(no replicas)')
+            print("(no replicas)")
 
         nodes = collections.defaultdict(list)
 
         for n, (start, replica, heartbeat, expired) in enumerate(ring):
-            hostname, pid, rnd = replica.split(':')
-            node = ':'.join([hostname, pid])
+            hostname, pid, _ = replica.split(":")
+            node = ":".join([hostname, pid])
 
             abs_size = (ring[(n + 1) % n_replicas][0] - ring[n][0]) % RING_SIZE
             size = 100.0 / RING_SIZE * abs_size
             delay = int(now - heartbeat)
+            expired_str = "(EXPIRED)" if expired else ""
 
             nodes[node].append((hostname, pid, abs_size, delay, expired))
 
             print(
-                '{start:10} {size:5.2f}% {delay:6}s {replica}{extra}'.format(
-                    start=start,
-                    replica=replica,
-                    delay=delay,
-                    size=size,
-                    extra=' (EXPIRED)' if expired else '',
-                )
+                f"{start:10} {size:5.2f}% {delay:6}s {replica} {expired_str}"
             )
 
         print()
@@ -198,12 +199,12 @@ class RingNode(object):
 
         if nodes:
             print(
-                '{:8} {:8} {:7} {:20} {:5}'.format(
-                    'Range', 'Replicas', 'Delay', 'Hostname', 'PID'
+                "{:8} {:8} {:7} {:20} {:5}".format(
+                    "Range", "Replicas", "Delay", "Hostname", "PID"
                 )
             )
         else:
-            print('(no nodes)')
+            print("(no nodes)")
 
         for k, v in nodes.items():
             hostname, pid = v[0][0], v[0][1]
@@ -212,32 +213,24 @@ class RingNode(object):
             delay = max(replica[3] for replica in v)
             expired = any(replica[4] for replica in v)
             count = len(v)
+            expired_str = "(EXPIRED)" if expired else ""
             print(
-                '{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}{extra}'.format(
-                    start=start,
-                    count=count,
-                    hostname=hostname,
-                    pid=pid,
-                    delay=delay,
-                    size=size,
-                    extra=' (EXPIRED)' if expired else '',
-                )
+                f"{size:5.2f}% {count:8} {delay:6}s {hostname:20} {pid:5}"
+                f" {expired_str}"
             )
 
     def heartbeat(self):
         """
-        Add/update the node in Redis. Needs to be called regularly by the
-        client.
+        Add/update the node in Redis.
+
+        Needs to be called regularly by the node.
         """
         pipeline = self.conn.pipeline()
+
         now = time.time()
+
         for replica in self.replicas:
-            pipeline.zadd(
-                self.key,
-                {
-                    '{start}:{name}'.format(start=replica[0], name=replica[1]): now,
-                },
-            )
+            pipeline.zadd(self.key, {f"{replica[0]}:{replica[1]}": now})
         ret = pipeline.execute()
 
         # Only notify the other nodes if we're not in the ring yet.
@@ -246,30 +239,28 @@ class RingNode(object):
 
     def remove(self):
         """
-        Call this to remove the node/replicas from the ring.
+        Remove the node from the ring.
         """
         pipeline = self.conn.pipeline()
+
         for replica in self.replicas:
-            pipeline.zrem(
-                self.key, '{start}:{name}'.format(start=replica[0], name=replica[1])
-            )
+            pipeline.zrem(self.key, f"{replica[0]}:{replica[1]}")
         pipeline.execute()
+
         self._notify()
 
     def _notify(self):
         """
-        Internal helper method which publishes an update to the ring's
-        activity channel.
+        Publish an update to the ring's activity channel.
         """
-        # Publish a dummy message on the activity channel
-        self.conn.publish(self.key, '*')
+        self.conn.publish(self.key, "*")
 
     def cleanup(self):
         """
-        Removes expired nodes/replicas from the ring.
+        Removes expired nodes from the ring.
         """
-        now = time.time()
-        expired = now - NODE_TIMEOUT
+        expired = time.time() - NODE_TIMEOUT
+
         if self.conn.zremrangebyscore(self.key, 0, expired):
             self._notify()
 
@@ -277,12 +268,14 @@ class RingNode(object):
         """
         Fetches the updated ring from Redis and updates the current ranges.
         """
-        ring = self._fetch()
+        ring = self._fetch_ring()
         n_replicas = len(ring)
-        replica_set = set([r[1] for r in self.replicas])
+
+        own_replicas = {r[1] for r in self.replicas}
+
         self.ranges = []
         for n, (start, replica) in enumerate(ring):
-            if replica in replica_set:
+            if replica in own_replicas:
                 end = ring[(n + 1) % n_replicas][0] % RING_SIZE
                 if start < end:
                     self.ranges.append((start, end))
@@ -294,8 +287,7 @@ class RingNode(object):
 
     def contains(self, key):
         """
-        Returns a boolean indicating if this node is responsible for handling
-        the given key.
+        Check whether this node is responsible for the item.
         """
         return self.contains_ring_point(self.key_as_ring_point(key))
 
@@ -305,8 +297,7 @@ class RingNode(object):
 
     def contains_ring_point(self, n):
         """
-        Returns a boolean indicating if this node is responsible for handling
-        the given point on a hash ring.
+        Check whether this node is responsible for the ring point.
         """
         for start, end in self.ranges:
             if start <= n < end:
@@ -315,15 +306,18 @@ class RingNode(object):
 
     def poll(self):
         """
-        Main loop which maintains the node in the hash ring. Can be run in a
-        greenlet or separate thread. This takes care of:
+        Keep a node in the hash ring.
 
-        * Updating the heartbeat
-        * Checking for ring updates
-        * Cleaning up expired nodes periodically
+        This should be kept running for as long as the node needs to stay in
+        the ring. Can be run in a separate thread or in a greenlet. This takes
+        care of:
+        * Updating the heartbeat.
+        * Checking for ring updates.
+        * Cleaning up expired nodes periodically.
         """
         pubsub = self.conn.pubsub()
         pubsub.subscribe(self.key)
+        pubsub_fd = pubsub.connection._sock.fileno()
 
         last_heartbeat = time.time()
         self.heartbeat()
@@ -335,17 +329,22 @@ class RingNode(object):
 
         try:
             while True:
-                # Since Redis' listen method blocks, we use select to inspect the
-                # underlying socket to see if there is activity.
-                pubsub_fd = pubsub.connection._sock.fileno()
-                timeout = max(0, POLL_INTERVAL - (time.time() - last_heartbeat))
-                r, w, x = self._select([self._stop_polling_fd_r, pubsub_fd], [], [], timeout)
+                # Since Redis' `listen` method blocks, we use `select` to
+                # inspect the underlying socket to see if there is activity.
+                timeout = max(
+                    0.0, POLL_INTERVAL - (time.time() - last_heartbeat)
+                )
+                r, _, _ = self._select(
+                    [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
+                )
+
                 if self._stop_polling_fd_r in r:
                     os.close(self._stop_polling_fd_r)
                     os.close(self._stop_polling_fd_w)
                     self._stop_polling_fd_r = None
                     self._stop_polling_fd_w = None
                     break
+
                 if pubsub_fd in r:
                     while pubsub.get_message():
                         pass
@@ -363,27 +362,27 @@ class RingNode(object):
 
     def start(self):
         """
-        Helper method to start the node for threads-based applications.
+        Start the node for threads-based applications.
         """
         self._polling_thread = threading.Thread(target=self.poll, daemon=True)
         self._polling_thread.start()
 
     def stop(self):
         """
-        Helper method to stop the node for threads-based applications.
+        Stop the node for threads-based applications.
         """
         if self._polling_thread:
             while not self._stop_polling_fd_w:
                 # Let's give the thread some time to create the fd.
                 time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b'1')
+            os.write(self._stop_polling_fd_w, b"1")
             self._polling_thread.join()
             self._polling_thread = None
         self.remove()
 
     def gevent_start(self):
         """
-        Helper method to start the node for gevent-based applications.
+        Start the node for gevent-based applications.
         """
         import gevent
         import gevent.select
@@ -395,15 +394,13 @@ class RingNode(object):
 
     def gevent_stop(self):
         """
-        Helper method to stop the node for gevent-based applications.
+        Stop the node for gevent-based applications.
         """
-        import gevent
-
         if self._polling_greenlet:
             while not self._stop_polling_fd_w:
                 # Let's give the greenlet some time to create the fd.
                 time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b'1')
+            os.write(self._stop_polling_fd_w, b"1")
             self._polling_greenlet.join()
             self._polling_greenlet = None
         self.remove()

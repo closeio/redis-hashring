@@ -4,9 +4,12 @@ workflows:
   version: 2
   workflow:
     jobs:
+      - lint
       - test-3.8
       - test-3.9
       - test-3.10
+      - test-3.11
+      - test-3.12
 
 defaults: &defaults
   working_directory: ~/code
@@ -17,21 +20,52 @@ defaults: &defaults
       command: pip install --user -r requirements.txt
   - run:
       name: Test
-      command: pytest tests.py
+      command: |
+        export PATH=$HOME/.local/bin:$PATH
+        pytest
 
 jobs:
+  lint:
+    working_directory: ~/code
+    docker:
+    - image: python:3.12
+    steps:
+    - checkout
+    - run:
+        name: Install dependencies
+        command: pip install --user -r requirements.txt
+    - run:
+        name: Format
+        command: |
+          export PATH=$HOME/.local/bin:$PATH
+          ruff format --check --no-cache
+    - run:
+        name: Lint
+        command: |
+          export PATH=$HOME/.local/bin:$PATH
+          ruff check --no-cache
   test-3.8:
     <<: *defaults
     docker:
-    - image: circleci/python:3.8
-    - image: redis:7.0.7
+    - image: python:3.8
+    - image: redis:7.2.4
   test-3.9:
     <<: *defaults
     docker:
-    - image: circleci/python:3.9
-    - image: redis:7.0.7
+    - image: python:3.9
+    - image: redis:7.2.4
   test-3.10:
     <<: *defaults
     docker:
-    - image: circleci/python:3.10
-    - image: redis:7.0.7
+    - image: python:3.10
+    - image: redis:7.2.4
+  test-3.11:
+    <<: *defaults
+    docker:
+    - image: python:3.11
+    - image: redis:7.2.4
+  test-3.12:
+    <<: *defaults
+    docker:
+    - image: python:3.12
+    - image: redis:7.2.4

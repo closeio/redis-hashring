@@ -1,0 +1,42 @@
+[tool.ruff]
+target-version = "py38"
+line-length = 79
+exclude = [
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+unfixable = [
+    # Variable assigned but never used - automatically removing the assignment
+    # is annoying when running autofix on work-in-progress code.
+    "F841",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"functools.partial".msg = "Use a lambda or a named function instead. Partials don't type check correctly."
+"datetime.datetime.utcnow".msg = "Use `datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)` instead."
+"datetime.datetime.utcfromtimestamp".msg = "Use `datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).replace(tzinfo=None)` instead."
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+forced-separate = ["tests"]
+
+[tool.ruff.lint.pydocstyle]
+# https://google.github.io/styleguide/pyguide.html#383-functions-and-methods
+convention = "google"
+
+[tool.ruff.lint.flake8-annotations]
+ignore-fully-untyped = true
+
+[tool.pytest.ini_options]
+timeout = 180
+python_files = "tests.py"
+testpaths = ["."]
+xfail_strict = true
