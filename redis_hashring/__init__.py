@@ -310,9 +310,9 @@ class RingNode(object):
         """
         Check whether this node is responsible for the item.
         """
-        return self._contains_ring_point(self._key_as_ring_point(key))
+        return self._contains_ring_point(self.key_as_ring_point(key))
 
-    def _key_as_ring_point(self, key):
+    def key_as_ring_point(self, key):
         """Turn a key into a point on a hash ring."""
         return binascii.crc32(key.encode()) % RING_SIZE
 
