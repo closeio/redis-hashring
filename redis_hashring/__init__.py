@@ -294,6 +294,12 @@ class RingNode(object):
 
         self._node_count = len(nodes)
 
+    def get_ranges(self):
+        """
+        Return the hash ring ranges that this node owns.
+        """
+        return self._ranges
+
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
