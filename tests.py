@@ -60,8 +60,20 @@ def test_node(redis):
     assert node2.get_node_count() == 3
     assert node3.get_node_count() == 3
 
+    node1.remove()
+    node2.update()
+    node3.update()
+    assert len(node1.get_ranges()) == 0
+    assert node1.get_node_count() == 0
+    assert len(node2.get_ranges()) + len(node3.get_ranges()) == 4
+    assert node2.get_node_count() == 2
+    assert node3.get_node_count() == 2
+
 
 def test_contains(redis):
     node1 = get_node(redis, 1, 1)
     node1.update()
     assert node1.contains("item") is True
+
+    node1.remove()
+    assert node1.contains("item") is False
