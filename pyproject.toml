@@ -9,6 +9,7 @@ exclude = [
 ]
 
 [tool.ruff.lint]
+extend-select = ["I"]
 unfixable = [
     # Variable assigned but never used - automatically removing the assignment
     # is annoying when running autofix on work-in-progress code.
