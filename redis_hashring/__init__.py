@@ -50,7 +50,7 @@ class RingNode(object):
     Represents a pubsub channel in Redis which receives a message every time
     the ring structure has changed.
 
-    Simple usage example for a distributed threads-based application:
+    Simple usage example:
 
     ```
     node = RingNode(redis, key)
@@ -65,22 +65,6 @@ class RingNode(object):
 
     node.stop()
     ```
-
-    Simple usage example for a distributed gevent-based application:
-
-    ```
-    node = RingNode(redis, key)
-    node.gevent_start()
-
-    while is_running:
-        # Only process items this node is responsible for. `item` should be an
-        # object that can be encoded to bytes by calling `item.encode()` on it,
-        # like a `str`.
-        items = [item for item in get_items() if node.contains(item)]
-        process_items(items)
-
-    node.gevent_stop()
-    ```
     """
 
     def __init__(self, conn, key, n_replicas=RING_REPLICAS):
@@ -93,7 +77,6 @@ class RingNode(object):
             n_replicas: Number of replicas this node should have on the ring.
         """
         self._polling_thread = None
-        self._polling_greenlet = None
         self._stop_polling_fd_r = None
         self._stop_polling_fd_w = None
 
@@ -405,7 +388,23 @@ class RingNode(object):
             self._polling_thread = None
         self.remove()
 
-    def gevent_start(self):
+
+class GeventRingNode(RingNode):
+    """
+    A node in a Redis hash ring.
+
+    This works exactly the same as `RingNode`, except that `start` and `stop`
+    will create a gevent greenlet to maintain the node information up to date
+    with the hash ring.
+
+    For a usage example, see the documentation for `RingNode`.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._polling_greenlet = None
+        super().__init__(*args, **kwargs)
+
+    def start(self):
         """
         Start the node for gevent-based applications.
         """
@@ -417,7 +416,7 @@ class RingNode(object):
         self.heartbeat()
         self.update()
 
-    def gevent_stop(self):
+    def stop(self):
         """
         Stop the node for gevent-based applications.
         """
