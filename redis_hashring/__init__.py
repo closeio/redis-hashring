@@ -65,6 +65,18 @@ class RingNode(object):
 
     node.stop()
     ```
+
+    As a context manager:
+
+    ```
+    with RingNode(redis, key) as node:
+        while is_running:
+            # Only process items this node is responsible for. `item` should be
+            # an object that can be encoded to bytes by calling `item.encode()`
+            # on it, like a `str`.
+            items = [item for item in get_items() if node.contains(item)]
+            process_items(items)
+    ```
     """
 
     def __init__(self, conn, key, n_replicas=RING_REPLICAS):
