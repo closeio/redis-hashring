@@ -420,6 +420,12 @@ class GeventRingNode(RingNode):
 
         self._select = gevent.select.select
         self._polling_greenlet = gevent.spawn(self.poll)
+
+        # Even though `self.poll` will run `self.heartbeat` and `self.update`
+        # immediately as it starts, this is gevent and `self.poll` may take a
+        # while to run, depending on how long the greenlet that creates the
+        # node takes to yield. So we'll run these functions here to make sure
+        # the node is up to date immediately.
         self.heartbeat()
         self.update()
 
