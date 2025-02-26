@@ -388,6 +388,13 @@ class RingNode(object):
             self._polling_thread = None
         self.remove()
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.stop()
+
 
 class GeventRingNode(RingNode):
     """
