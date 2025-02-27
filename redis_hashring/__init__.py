@@ -65,6 +65,18 @@ class RingNode(object):
 
     node.stop()
     ```
+
+    As a context manager:
+
+    ```
+    with RingNode(redis, key) as node:
+        while is_running:
+            # Only process items this node is responsible for. `item` should be
+            # an object that can be encoded to bytes by calling `item.encode()`
+            # on it, like a `str`.
+            items = [item for item in get_items() if node.contains(item)]
+            process_items(items)
+    ```
     """
 
     def __init__(self, conn, key, n_replicas=RING_REPLICAS):
@@ -388,6 +400,13 @@ class RingNode(object):
             self._polling_thread = None
         self.remove()
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self.stop()
+
 
 class GeventRingNode(RingNode):
     """
@@ -413,6 +432,12 @@ class GeventRingNode(RingNode):
 
         self._select = gevent.select.select
         self._polling_greenlet = gevent.spawn(self.poll)
+
+        # Even though `self.poll` will run `self.heartbeat` and `self.update`
+        # immediately as it starts, this is gevent and `self.poll` may take a
+        # while to run, depending on how long the greenlet that creates the
+        # node takes to yield. So we'll run these functions here to make sure
+        # the node is up to date immediately.
         self.heartbeat()
         self.update()
 
