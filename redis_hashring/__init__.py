@@ -1,5 +1,6 @@
 import binascii
 import collections
+import enum
 import operator
 import os
 import random
@@ -8,12 +9,22 @@ import socket
 import threading
 import time
 
-# Amount of points on the ring. Must not be higher than 2**32 because we're
-# using CRC32 to compute the checksum.
+try:
+    import xxhash
+except ImportError:
+    xxhash = None
+
+# Amount of points on the ring. Must not be higher than 2**32.
 RING_SIZE = 2**32
 
 # Default amount of replicas per node.
 RING_REPLICAS = 16
+
+
+class HashAlgorithm(enum.Enum):
+    CRC32 = "crc32"
+    XXHASH = "xxhash"
+
 
 # How often to update a node's heartbeat.
 POLL_INTERVAL = 10
@@ -23,6 +34,14 @@ NODE_TIMEOUT = 60
 
 # How often expired nodes are cleaned up from the ring.
 CLEANUP_INTERVAL = 120
+
+
+def _hash_with_xxhash(key):
+    return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
+
+
+def _hash_with_crc32(key):
+    return binascii.crc32(key.encode()) % RING_SIZE
 
 
 def _decode(data):
@@ -66,6 +85,16 @@ class RingNode(object):
     node.stop()
     ```
 
+    Using CRC-32 (if you need to support hashrings created before xxHash
+    support was introduced):
+
+    ```
+    from redis_hashring import RingNode, HashAlgorithm
+
+    node = RingNode(redis, key, hash_algorithm=HashAlgorithm.CRC32)
+    node.start()
+    ```
+
     As a context manager:
 
     ```
@@ -79,7 +108,14 @@ class RingNode(object):
     ```
     """
 
-    def __init__(self, conn, key, n_replicas=RING_REPLICAS):
+    def __init__(
+        self,
+        conn,
+        key,
+        *,
+        n_replicas=RING_REPLICAS,
+        hash_algorithm=HashAlgorithm.XXHASH,
+    ):
         """
         Initializes a Redis hash ring node.
 
@@ -87,6 +123,11 @@ class RingNode(object):
             conn: The Redis connection to use.
             key: A key to use for this node.
             n_replicas: Number of replicas this node should have on the ring.
+            hash_algorithm: Hash algorithm to use. It is recommended to use
+                `HashAlgorithm.XXHASH` (the default) because it provides better
+                uniform distribution than CRC-32 with faster hashing. If you
+                need to support hashrings created before we introduced support
+                for xxHash, use `HashAlgorithm.CRC32`.
         """
         self._polling_thread = None
         self._stop_polling_fd_r = None
@@ -94,6 +135,19 @@ class RingNode(object):
 
         self._conn = conn
         self._key = key
+
+        if hash_algorithm is HashAlgorithm.XXHASH:
+            if xxhash is None:
+                raise ImportError(
+                    "xxhash library is required for XXHASH algorithm. "
+                    "Install with: pip install redis-hashring[xxhash]"
+                )
+            self._hash_function = _hash_with_xxhash
+        elif hash_algorithm is HashAlgorithm.CRC32:
+            self._hash_function = _hash_with_crc32
+        else:
+            raise ValueError("Unexpected hash algorithm requested")
+
         host = socket.gethostname()
         pid = os.getpid()
 
@@ -313,7 +367,7 @@ class RingNode(object):
 
     def key_as_ring_point(self, key):
         """Turn a key into a point on a hash ring."""
-        return binascii.crc32(key.encode()) % RING_SIZE
+        return self._hash_function(key)
 
     def _contains_ring_point(self, n):
         """
