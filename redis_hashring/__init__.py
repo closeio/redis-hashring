@@ -85,12 +85,13 @@ class RingNode(object):
     node.stop()
     ```
 
-    Using xxHash for better distribution:
+    Using CRC-32 (if you need to support hashrings created before xxHash
+    support was introduced):
 
     ```
     from redis_hashring import RingNode, HashAlgorithm
 
-    node = RingNode(redis, key, hash_algorithm=HashAlgorithm.XXHASH)
+    node = RingNode(redis, key, hash_algorithm=HashAlgorithm.CRC32)
     node.start()
     ```
 
@@ -111,8 +112,9 @@ class RingNode(object):
         self,
         conn,
         key,
+        *,
         n_replicas=RING_REPLICAS,
-        hash_algorithm=HashAlgorithm.CRC32,
+        hash_algorithm=HashAlgorithm.XXHASH,
     ):
         """
         Initializes a Redis hash ring node.
@@ -121,8 +123,11 @@ class RingNode(object):
             conn: The Redis connection to use.
             key: A key to use for this node.
             n_replicas: Number of replicas this node should have on the ring.
-            hash_algorithm: Hash algorithm to use (defaults to CRC32 for
-            backwards compatibility).
+            hash_algorithm: Hash algorithm to use. It is recommended to use
+                `HashAlgorithm.XXHASH` (the default) because it provides better
+                uniform distribution than CRC-32 with faster hashing. If you
+                need to support hashrings created before we introduced support
+                for xxHash, use `HashAlgorithm.CRC32`.
         """
         self._polling_thread = None
         self._stop_polling_fd_r = None

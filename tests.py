@@ -17,11 +17,9 @@ def redis():
 
 
 def get_node(
-    redis, n_replicas, total_replicas, hash_algorithm=HashAlgorithm.CRC32
+    redis, n_replicas, total_replicas, hash_algorithm=HashAlgorithm.XXHASH
 ):
-    node = RingNode(
-        redis, TEST_KEY, n_replicas=n_replicas, hash_algorithm=hash_algorithm
-    )
+    node = RingNode(redis, TEST_KEY, n_replicas=n_replicas)
 
     assert len(node._replicas) == n_replicas
     assert redis.zcard(TEST_KEY) == total_replicas - n_replicas
