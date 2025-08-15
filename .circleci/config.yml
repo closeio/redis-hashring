@@ -10,6 +10,7 @@ workflows:
       - test-3.10
       - test-3.11
       - test-3.12
+      - test-3.13
 
 defaults: &defaults
   working_directory: ~/code
@@ -28,7 +29,7 @@ jobs:
   lint:
     working_directory: ~/code
     docker:
-    - image: python:3.12
+    - image: python:3.13
     steps:
     - checkout
     - run:
@@ -68,4 +69,9 @@ jobs:
     <<: *defaults
     docker:
     - image: python:3.12
+    - image: redis:7.2.4
+  test-3.13:
+    <<: *defaults
+    docker:
+    - image: python:3.13
     - image: redis:7.2.4

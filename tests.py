@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 from redis import Redis
 
-from redis_hashring import RingNode
+from redis_hashring import HashAlgorithm, RingNode
 
 TEST_KEY = "hashring-test"
 
@@ -16,8 +16,12 @@ def redis():
     redis.delete(TEST_KEY)
 
 
-def get_node(redis, n_replicas, total_replicas):
-    node = RingNode(redis, TEST_KEY, n_replicas=n_replicas)
+def get_node(
+    redis, n_replicas, total_replicas, hash_algorithm=HashAlgorithm.CRC32
+):
+    node = RingNode(
+        redis, TEST_KEY, n_replicas=n_replicas, hash_algorithm=hash_algorithm
+    )
 
     assert len(node._replicas) == n_replicas
     assert redis.zcard(TEST_KEY) == total_replicas - n_replicas
@@ -70,8 +74,11 @@ def test_node(redis):
     assert node3.get_node_count() == 2
 
 
-def test_contains(redis):
-    node1 = get_node(redis, 1, 1)
+@pytest.mark.parametrize(
+    "hash_algorithm", [HashAlgorithm.CRC32, HashAlgorithm.XXHASH]
+)
+def test_contains(redis, hash_algorithm):
+    node1 = get_node(redis, 1, 1, hash_algorithm=hash_algorithm)
     node1.update()
     assert node1.contains("item") is True
 
