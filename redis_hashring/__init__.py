@@ -131,18 +131,17 @@ class RingNode(object):
         self._conn = conn
         self._key = key
 
-        match hash_algorithm:
-            case HashAlgorithm.XXHASH:
-                if xxhash is None:
-                    raise ImportError(
-                        "xxhash library is required for XXHASH algorithm. "
-                        "Install with: pip install redis-hashring[xxhash]"
-                    )
-                self._hash_function = _hash_with_xxhash
-            case HashAlgorithm.CRC32:
-                self._hash_function = _hash_with_crc32
-            case _:
-                raise ValueError("Unexpected hash algorithm requested")
+        if hash_algorithm is HashAlgorithm.XXHASH:
+            if xxhash is None:
+                raise ImportError(
+                    "xxhash library is required for XXHASH algorithm. "
+                    "Install with: pip install redis-hashring[xxhash]"
+                )
+            self._hash_function = _hash_with_xxhash
+        elif hash_algorithm is HashAlgorithm.CRC32:
+            self._hash_function = _hash_with_crc32
+        else:
+            raise ValueError("Unexpected hash algorithm requested")
 
         host = socket.gethostname()
         pid = os.getpid()
