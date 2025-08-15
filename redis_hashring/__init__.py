@@ -36,6 +36,14 @@ NODE_TIMEOUT = 60
 CLEANUP_INTERVAL = 120
 
 
+def _hash_with_xxhash(key):
+    return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
+
+
+def _hash_with_crc32(key):
+    return binascii.crc32(key.encode()) % RING_SIZE
+
+
 def _decode(data):
     # Compatibility with different redis-py `decode_responses` settings.
     if isinstance(data, bytes):
@@ -122,13 +130,19 @@ class RingNode(object):
 
         self._conn = conn
         self._key = key
-        self._hash_algorithm = hash_algorithm
 
-        if hash_algorithm == HashAlgorithm.XXHASH and xxhash is None:
-            raise ImportError(
-                "xxhash library is required for XXHASH algorithm. "
-                "Install with: pip install redis-hashring[xxhash]"
-            )
+        match hash_algorithm:
+            case HashAlgorithm.XXHASH:
+                if xxhash is None:
+                    raise ImportError(
+                        "xxhash library is required for XXHASH algorithm. "
+                        "Install with: pip install redis-hashring[xxhash]"
+                    )
+                self._hash_function = _hash_with_xxhash
+            case HashAlgorithm.CRC32:
+                self._hash_function = _hash_with_crc32
+            case _:
+                raise ValueError("Unexpected hash algorithm requested")
 
         host = socket.gethostname()
         pid = os.getpid()
@@ -349,14 +363,7 @@ class RingNode(object):
 
     def key_as_ring_point(self, key):
         """Turn a key into a point on a hash ring."""
-        if self._hash_algorithm == HashAlgorithm.CRC32:
-            return binascii.crc32(key.encode()) % RING_SIZE
-        elif self._hash_algorithm == HashAlgorithm.XXHASH:
-            return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
-        else:
-            raise ValueError(
-                f"Unsupported hash algorithm: {self._hash_algorithm}"
-            )
+        return self._hash_function(key)
 
     def _contains_ring_point(self, n):
         """
