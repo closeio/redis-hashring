@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="redis-hashring",
-    version="0.5.0",
+    version="0.6.0",
     author="Close Engineering",
     author_email="engineering@close.com",
     url="https://github.com/closeio/redis-hashring",
@@ -23,11 +23,10 @@ setup(
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     packages=["redis_hashring"],
 )

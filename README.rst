@@ -1,8 +1,6 @@
 ==============
 redis-hashring
 ==============
-.. image:: https://circleci.com/gh/closeio/redis-hashring.svg?style=svg&circle-token=e9b81f0e4bc9a1a0b6150522e854ca0c9b1c2881
-    :target: https://circleci.com/gh/closeio/redis-hashring/tree/master
 
 *redis-hashring* is a Python library that implements a consistent hash ring
 for building distributed applications, which is stored in Redis.
@@ -47,14 +45,15 @@ points from its randomly generated starting point until the starting point of
 the next node / replica.
 
 To check if a node is responsible for a given key, the key's position on the
-ring is determined by hashing the key using CRC-32.
+ring is determined by hashing the key using xxHash (CRC-32 is also supported
+for backwards-compatibility).
 
 For example, let's say there are two nodes, having one replica each. The first
 node is at 1 000 000 000 (1e9), the second at 2e9. In this case, the first node
 is responsible for the range [1e9, 2e9-1], the second node is responsible for
-[2e9, 2^32-1] and [0, 1e9-1], since the ring wraps. To check if the key
-*hello* is on the ring, we compute CRC-32, which is 907 060 870, and the value
-is therefore on the first node.
+[2e9, 2^32-1] and [0, 1e9-1], since the ring wraps. To check to which node the
+key *hello* belongs, we compute its hash, which is 4 211 111 929, and the value
+is therefore on the second node.
 
 Since the node replica points are picked randomly, it is recommended to have
 multiple replicas of the node on a ring to ensure a more even distribution of
@@ -168,8 +167,8 @@ We can inspect the ring:
 gevent example
 --------------
 
-*redis-hashring* provides a ``RingNode`` class, which has helper methods for
-`gevent`-based applications. The ``RingNode.gevent_start()`` method spawns a
+*redis-hashring* provides a ``GeventRingNode`` class, which has helper methods
+for `gevent`-based applications. The ``GeventRingNode.start()`` method spawns a
 greenlet that initializes the ring and periodically updates the node's
 replicas.
 
@@ -178,13 +177,13 @@ An example app could look as follows:
 .. code:: python
 
   from redis import Redis
-  from redis_hashring import RingNode
+  from redis_hashring import GeventRingNode
 
   KEY = 'example-ring'
 
   redis = Redis()
-  node = RingNode(redis, KEY)
-  node.gevent_start()
+  node = GeventRingNode(redis, KEY)
+  node.start()
 
   def get_items():
       """
@@ -206,7 +205,7 @@ An example app could look as follows:
   except KeyboardInterrupt:
       pass
 
-  node.gevent_stop()
+  node.stop()
 
 Implementation considerations
 -----------------------------
