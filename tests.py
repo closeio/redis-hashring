@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 from redis import Redis
 
-from redis_hashring import RingNode
+from redis_hashring import HashAlgorithm, RingNode
 
 TEST_KEY = "hashring-test"
 
@@ -16,8 +16,10 @@ def redis():
     redis.delete(TEST_KEY)
 
 
-def get_node(redis, n_replicas, total_replicas):
-    node = RingNode(redis, TEST_KEY, n_replicas=n_replicas)
+def get_node(redis, n_replicas, total_replicas, hash_algorithm):
+    node = RingNode(
+        redis, TEST_KEY, n_replicas=n_replicas, hash_algorithm=hash_algorithm
+    )
 
     assert len(node._replicas) == n_replicas
     assert redis.zcard(TEST_KEY) == total_replicas - n_replicas
@@ -32,13 +34,13 @@ def get_node(redis, n_replicas, total_replicas):
 
 def test_node(redis):
     with patch.object(socket, "gethostname", return_value="host1"):
-        node1 = get_node(redis, 1, 1)
+        node1 = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
     node1.update()
     assert len(node1.get_ranges()) == 1
     assert node1.get_node_count() == 1
 
     with patch.object(socket, "gethostname", return_value="host2"):
-        node2 = get_node(redis, 1, 2)
+        node2 = get_node(redis, 1, 2, HashAlgorithm.XXHASH)
     node1.update()
     node2.update()
     assert len(node1.get_ranges()) + len(node2.get_ranges()) == 3
@@ -46,7 +48,7 @@ def test_node(redis):
     assert node2.get_node_count() == 2
 
     with patch.object(socket, "gethostname", return_value="host3"):
-        node3 = get_node(redis, 2, 4)
+        node3 = get_node(redis, 2, 4, HashAlgorithm.XXHASH)
     node1.update()
     node2.update()
     node3.update()
@@ -70,8 +72,11 @@ def test_node(redis):
     assert node3.get_node_count() == 2
 
 
-def test_contains(redis):
-    node1 = get_node(redis, 1, 1)
+@pytest.mark.parametrize(
+    "hash_algorithm", [HashAlgorithm.CRC32, HashAlgorithm.XXHASH]
+)
+def test_contains(redis, hash_algorithm):
+    node1 = get_node(redis, 1, 1, hash_algorithm=hash_algorithm)
     node1.update()
     assert node1.contains("item") is True
 

@@ -11,6 +11,9 @@ setup(
         "Python library for distributed applications using a Redis hash ring"
     ),
     install_requires=["redis>=3"],
+    extras_require={
+        "xxhash": ["xxhash>=3.5.0"],
+    },
     platforms="any",
     classifiers=[
         "Intended Audience :: Developers",
