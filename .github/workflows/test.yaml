@@ -5,12 +5,15 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   lint:
     runs-on: ubuntu-24.04
-    container:
-      image: python:3.13
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Format
         run: |
@@ -35,12 +38,15 @@ jobs:
           --health-retries 5
         ports:
           - 6379:6379
-    container:
-      image: python:${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Test
         run: |
