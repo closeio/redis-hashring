@@ -1,6 +1,6 @@
 name: test-workflow
 
-on: [push, pull_request, workflow_dispatch]
+on: [push]
 
 permissions:
   contents: read
