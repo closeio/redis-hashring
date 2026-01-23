@@ -1,0 +1,47 @@
+name: test-workflow
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.13
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Format
+        run: |
+          ruff format --check --no-cache
+      - name: Lint
+        run: |
+          ruff check --no-cache
+
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    services:
+      redis:
+        image: redis:7.2.4
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    container:
+      image: python:${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Test
+        run: |
+          pytest
