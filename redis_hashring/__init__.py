@@ -170,8 +170,6 @@ class RingNode(object):
         # (a, b) includes any N matching a <= N < b.
         self._ranges = []
 
-        self._select = select.select
-
     def _fetch_ring(self):
         """
         Fetch the ring from Redis.
@@ -383,8 +381,7 @@ class RingNode(object):
         Keep a node in the hash ring.
 
         This should be kept running for as long as the node needs to stay in
-        the ring. Can be run in a separate thread or in a greenlet. This takes
-        care of:
+        the ring. This takes care of:
         * Updating the heartbeat.
         * Checking for ring updates.
         * Cleaning up expired nodes periodically.
@@ -408,7 +405,7 @@ class RingNode(object):
                 timeout = max(
                     0.0, POLL_INTERVAL - (time.time() - last_heartbeat)
                 )
-                r, _, _ = self._select(
+                r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
                 )
 
@@ -436,14 +433,14 @@ class RingNode(object):
 
     def start(self):
         """
-        Start the node for threads-based applications.
+        Start the node.
         """
         self._polling_thread = threading.Thread(target=self.poll, daemon=True)
         self._polling_thread.start()
 
     def stop(self):
         """
-        Stop the node for threads-based applications.
+        Stop the node.
         """
         if self._polling_thread:
             while not self._stop_polling_fd_w:
@@ -460,51 +457,3 @@ class RingNode(object):
 
     def __exit__(self, *args, **kwargs):
         self.stop()
-
-
-class GeventRingNode(RingNode):
-    """
-    A node in a Redis hash ring.
-
-    This works exactly the same as `RingNode`, except that `start` and `stop`
-    will create a gevent greenlet to maintain the node information up to date
-    with the hash ring.
-
-    For a usage example, see the documentation for `RingNode`.
-    """
-
-    def __init__(self, *args, **kwargs):
-        self._polling_greenlet = None
-        super().__init__(*args, **kwargs)
-
-    def start(self):
-        """
-        Start the node for gevent-based applications.
-        """
-        import gevent
-        import gevent.select
-
-        self._select = gevent.select.select
-        self._polling_greenlet = gevent.spawn(self.poll)
-
-        # Even though `self.poll` will run `self.heartbeat` and `self.update`
-        # immediately as it starts, this is gevent and `self.poll` may take a
-        # while to run, depending on how long the greenlet that creates the
-        # node takes to yield. So we'll run these functions here to make sure
-        # the node is up to date immediately.
-        self.heartbeat()
-        self.update()
-
-    def stop(self):
-        """
-        Stop the node for gevent-based applications.
-        """
-        if self._polling_greenlet:
-            while not self._stop_polling_fd_w:
-                # Let's give the greenlet some time to create the fd.
-                time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b"1")
-            self._polling_greenlet.join()
-            self._polling_greenlet = None
-        self.remove()
-        self._select = select.select
