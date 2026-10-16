@@ -229,3 +229,26 @@ the following:
   multiple nodes would need to be running to sync all the accounts. Also note
   that the ring is not usually equally balanced, so running 2 nodes wouldn't be
   enough in this example.
+
+- Startup and shutdown
+
+  `RingNode.start()` returns when the node is in the ring and has its ranges.
+  Thus, `contains()` gives correct results right after `start()`.
+
+  If the node cannot join the ring, `start()` raises the error. For example,
+  this happens when Redis is not available. Before it raises, `start()` tries
+  to remove the replicas that the node added to the ring, if any. If the
+  removal also fails, the other nodes ignore these replicas after 60 seconds.
+
+  If the node already started, `start()` raises `RuntimeError`. After
+  `stop()`, or after a `start()` call that raises, the node can start again.
+
+  `start()` waits up to 10 seconds for Redis to confirm the subscription to
+  the channel of the ring. If no reply arrives, `start()` raises
+  `redis.exceptions.TimeoutError`.
+
+  For the other Redis calls, `start()` and `stop()` have no timeout of their
+  own. `start()` waits for the node to join the ring. `stop()` waits for the
+  Redis call that the thread runs, if any. The socket timeouts of the Redis
+  client limit these waits. Without socket timeouts, both methods can wait
+  forever if Redis does not respond.
