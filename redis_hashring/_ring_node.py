@@ -1,12 +1,12 @@
 import binascii
 import collections
 import enum
+import logging
 import math
 import operator
 import os
 import random
 import socket
-import sys
 import threading
 import time
 
@@ -65,6 +65,9 @@ _RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
 
 _EMPTY_STATE = _RingState(ranges=(), node_count=0)
 
+# The README names this logger, so that applications can configure it.
+_logger = logging.getLogger("redis_hashring")
+
 
 def _hash_with_xxhash(key):
     return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
@@ -93,18 +96,17 @@ def _close_pubsub(pubsub):
             pass
 
 
-def _report_error():
+def _log(level, message, *args, exc_info=None):
     """
-    Pass the error that the current thread handles to `threading.excepthook`.
+    Log a message with `_logger`, and ignore errors from the log handlers.
+
+    If `exc_info` is true, add the error that the current thread handles to
+    the record.
     """
     try:
-        threading.excepthook(
-            threading.ExceptHookArgs(
-                [*sys.exc_info(), threading.current_thread()]
-            )
-        )
+        _logger.log(level, message, *args, exc_info=exc_info)
     except Exception:
-        # An error in the hook must not end the thread.
+        # An error in a log handler must not end the thread.
         pass
 
 
@@ -450,6 +452,41 @@ class RingNode(object):
         """
         self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
 
+    def _check_deadline(self, gave_up_keys, exc_info=None):
+        """
+        Return whether `self._deadline` passed.
+
+        The node gives up its keys when the deadline passes. Log when the
+        node gives up its keys, and when it gets them back.
+
+        Args:
+            gave_up_keys: The result of the previous call.
+            exc_info: Whether to add the error that the current thread handles
+                to the record about the keys that the node gave up.
+        """
+        now = time.monotonic()
+        deadline_passed = now >= self._deadline
+        if deadline_passed and not gave_up_keys:
+            # The record can come long after the deadline, for example after
+            # a Redis call that blocked. State the delay.
+            _log(
+                logging.ERROR,
+                "The node in the ring %r gave up its keys %.1f seconds ago,"
+                " after %s seconds without a successful heartbeat and read"
+                " of the ring.",
+                self._key,
+                now - self._deadline,
+                NODE_TIMEOUT - POLL_INTERVAL,
+                exc_info=exc_info,
+            )
+        elif gave_up_keys and not deadline_passed:
+            _log(
+                logging.INFO,
+                "The node in the ring %r got its keys back.",
+                self._key,
+            )
+        return deadline_passed
+
     def _poll(self):
         """
         Keep the node in the ring until `stop` asks the thread to exit.
@@ -514,9 +551,13 @@ class RingNode(object):
           heartbeat. If a heartbeat ends after the deadline of the previous
           heartbeat, notify the other nodes.
 
-        Report each error, and try again, until `stop` asks the thread to
-        exit. Then close the pub/sub object, clear the state, and remove the
+        Log each error, and try again, until `stop` asks the thread to exit.
+        Then close the pub/sub object, clear the state, and remove the
         deadline.
+
+        Log when the node gives up its keys, and when it gets them back.
+        Check after each failed attempt and the wait after it, and after each
+        heartbeat and the update after it.
 
         Args:
             pubsub: A pub/sub object, subscribed to the ring's activity
@@ -527,6 +568,8 @@ class RingNode(object):
                 cleanup.
         """
         retry_interval = RETRY_INTERVAL_MIN
+        # Whether the deadline passed at the last check.
+        gave_up_keys = False
         try:
             while not self._stop_requested.is_set():
                 try:
@@ -563,10 +606,14 @@ class RingNode(object):
                         # subscription, or a pub/sub connection that died
                         # without an error, can miss changes.
                         self._update()
+                        # A Redis call that blocks can let the deadline pass
+                        # with no error. Check before the deadline moves.
+                        gave_up_keys = self._check_deadline(gave_up_keys)
                         # Move the deadline after `_update`, not after the
                         # heartbeat. Thus, if `_update` fails after the
                         # deadline, readers do not see the old ranges again.
                         self._deadline = _deadline_after(last_heartbeat)
+                        gave_up_keys = self._check_deadline(gave_up_keys)
 
                     # If `stop` asked the thread to exit during the update,
                     # exit before the wait for a notice.
@@ -592,10 +639,25 @@ class RingNode(object):
 
                     retry_interval = RETRY_INTERVAL_MIN
                 except Exception:
-                    _report_error()
+                    _log(
+                        logging.WARNING,
+                        "An attempt of the node in the ring %r failed. The"
+                        " node will try again.",
+                        self._key,
+                        exc_info=True,
+                    )
+                    gave_up_keys = self._check_deadline(
+                        gave_up_keys, exc_info=True
+                    )
                     _close_pubsub(pubsub)
                     pubsub = None
                     self._wait_before_retry(retry_interval)
+                    # The deadline can pass during the wait. Check again
+                    # while the thread still handles the error, so that the
+                    # record holds it.
+                    gave_up_keys = self._check_deadline(
+                        gave_up_keys, exc_info=True
+                    )
                     retry_interval = min(
                         retry_interval * 2, RETRY_INTERVAL_MAX
                     )

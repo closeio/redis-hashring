@@ -283,9 +283,9 @@ the following:
   longest wait is 1 second after the first error. It doubles after each
   failed attempt, up to 10 seconds.
 
-  The node passes each error to `threading.excepthook`. By default, Python
-  prints the traceback of the error to stderr. To handle the errors in another
-  way, set `threading.excepthook` in the application.
+  The node logs each error with the logger `redis_hashring`, at the level
+  `WARNING`, with the traceback. Without a logging configuration, Python
+  prints the records of the level `WARNING` and higher to stderr.
 
   The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
   node misses a notice of a change of the ring, it sees the change within 10
@@ -305,3 +305,15 @@ the following:
   keys back. If the node had no successful heartbeat for 50 seconds, it
   notifies the other nodes after the next heartbeat. Then they read the ring
   and give the keys back.
+
+  When the node gives up its keys, it logs one record at the level `ERROR`.
+  If the node gives up its keys during a failed attempt, or during the wait
+  after it, the record holds the traceback of the error. When the node gets
+  its keys back, it logs one record at the level `INFO`. Thus, a Redis outage
+  gives one record of the level `ERROR` for each node, not one for each
+  failed attempt.
+
+  The node checks for these changes after each failed attempt and the wait
+  after it, and after each heartbeat. Thus, if a Redis call of the node
+  blocks, the record comes after the call ends, at the next check. The
+  record of the level `ERROR` states how long ago the node gave up its keys.
