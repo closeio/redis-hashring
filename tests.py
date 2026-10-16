@@ -1,6 +1,9 @@
 import itertools
 import math
+import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import Mock, patch
@@ -14,12 +17,8 @@ from redis.exceptions import (
 )
 
 import redis_hashring
-from redis_hashring import (
-    RING_SIZE,
-    SUBSCRIBE_TIMEOUT,
-    HashAlgorithm,
-    RingNode,
-)
+from redis_hashring import RING_SIZE, HashAlgorithm, RingNode, _ring_node
+from redis_hashring.__main__ import _connect, _describe_server, _main
 
 TEST_KEY = "hashring-test"
 
@@ -41,7 +40,7 @@ def short_stop_check_interval():
     """
     Make the thread check for a request to stop every 0.05 s.
     """
-    with patch.object(redis_hashring, "STOP_CHECK_INTERVAL", 0.05):
+    with patch.object(_ring_node, "STOP_CHECK_INTERVAL", 0.05):
         yield
 
 
@@ -53,7 +52,7 @@ def get_node(redis, n_replicas, total_replicas, hash_algorithm):
     assert len(node._replicas) == n_replicas
     assert redis.zcard(TEST_KEY) == total_replicas - n_replicas
 
-    node.heartbeat()
+    node._heartbeat()
 
     assert redis.zcard(TEST_KEY) == total_replicas
     assert len(node.get_ranges()) == 0
@@ -64,23 +63,23 @@ def get_node(redis, n_replicas, total_replicas, hash_algorithm):
 def test_node(redis):
     with patch.object(socket, "gethostname", return_value="host1"):
         node1 = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
-    node1.update()
+    node1._update()
     assert len(node1.get_ranges()) == 1
     assert node1.get_node_count() == 1
 
     with patch.object(socket, "gethostname", return_value="host2"):
         node2 = get_node(redis, 1, 2, HashAlgorithm.XXHASH)
-    node1.update()
-    node2.update()
+    node1._update()
+    node2._update()
     assert len(node1.get_ranges()) + len(node2.get_ranges()) == 3
     assert node1.get_node_count() == 2
     assert node2.get_node_count() == 2
 
     with patch.object(socket, "gethostname", return_value="host3"):
         node3 = get_node(redis, 2, 4, HashAlgorithm.XXHASH)
-    node1.update()
-    node2.update()
-    node3.update()
+    node1._update()
+    node2._update()
+    node3._update()
     assert (
         len(node1.get_ranges())
         + len(node2.get_ranges())
@@ -91,9 +90,9 @@ def test_node(redis):
     assert node2.get_node_count() == 3
     assert node3.get_node_count() == 3
 
-    node1.remove()
-    node2.update()
-    node3.update()
+    node1._remove()
+    node2._update()
+    node3._update()
     assert len(node1.get_ranges()) == 0
     assert node1.get_node_count() == 0
     assert len(node2.get_ranges()) + len(node3.get_ranges()) == 4
@@ -106,11 +105,64 @@ def test_node(redis):
 )
 def test_contains(redis, hash_algorithm):
     node1 = get_node(redis, 1, 1, hash_algorithm=hash_algorithm)
-    node1.update()
+    node1._update()
     assert node1.contains("item") is True
 
-    node1.remove()
+    node1._remove()
     assert node1.contains("item") is False
+
+
+def public_names(namespace):
+    """
+    Return the names in `namespace` that do not start with `_`.
+    """
+    return {name for name in dir(namespace) if not name.startswith("_")}
+
+
+def test_public_api():
+    assert public_names(redis_hashring) == {
+        "RING_SIZE",
+        "HashAlgorithm",
+        "RingNode",
+    }
+    assert set(redis_hashring.__all__) == public_names(redis_hashring)
+    assert public_names(RingNode) == {
+        "contains",
+        "get_node_count",
+        "get_ranges",
+        "key_as_ring_point",
+        "start",
+        "stop",
+    }
+    # The node is also a context manager.
+    assert hasattr(RingNode, "__enter__")
+    assert hasattr(RingNode, "__exit__")
+    members = {member.name: member.value for member in HashAlgorithm}
+    assert members == {"CRC32": "crc32", "XXHASH": "xxhash"}
+
+
+# Read the values when the module loads, before the fixtures patch them.
+DOCUMENTED_VALUES = {
+    "POLL_INTERVAL": _ring_node.POLL_INTERVAL,
+    "NODE_TIMEOUT": _ring_node.NODE_TIMEOUT,
+    "SUBSCRIBE_TIMEOUT": _ring_node.SUBSCRIBE_TIMEOUT,
+    "STOP_CHECK_INTERVAL": _ring_node.STOP_CHECK_INTERVAL,
+    "RETRY_INTERVAL_MIN": _ring_node.RETRY_INTERVAL_MIN,
+    "RETRY_INTERVAL_MAX": _ring_node.RETRY_INTERVAL_MAX,
+}
+
+
+def test_documented_values():
+    # The README and the docstrings of `RingNode` state these values. If this
+    # test fails, update the text, and then this test.
+    assert DOCUMENTED_VALUES == {
+        "POLL_INTERVAL": 10,
+        "NODE_TIMEOUT": 60,
+        "SUBSCRIBE_TIMEOUT": 10,
+        "STOP_CHECK_INTERVAL": 1,
+        "RETRY_INTERVAL_MIN": 1,
+        "RETRY_INTERVAL_MAX": 10,
+    }
 
 
 def find_key(node, start, end):
@@ -181,11 +233,11 @@ def test_get_ranges_returns_tuple(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
     assert node.get_ranges() == ()
 
-    node.update()
+    node._update()
     assert isinstance(node.get_ranges(), tuple)
     assert node.get_ranges() == ((0, RING_SIZE),)
 
-    node.remove()
+    node._remove()
     assert node.get_ranges() == ()
 
 
@@ -196,11 +248,11 @@ def test_readers_see_old_state_during_update(redis):
     key = find_key(node, 2**31, RING_SIZE)
 
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
-    node.update()
+    node._update()
 
     ring = PausingRing([(0, own_replica), (2**31, OTHER_REPLICA)])
     node._fetch_ring = Mock(return_value=ring)
-    update_thread = start_thread(node.update)
+    update_thread = start_thread(node._update)
     assert ring.paused.wait(timeout=5)
 
     assert node.get_ranges() == ((0, RING_SIZE),)
@@ -224,9 +276,9 @@ def test_update_calls_run_one_at_a_time(redis):
     )
     node._fetch_ring = fetch_ring
 
-    first_update_thread = start_thread(node.update)
+    first_update_thread = start_thread(node._update)
     assert fetch_ring.started.wait(timeout=5)
-    second_update_thread = start_thread(node.update)
+    second_update_thread = start_thread(node._update)
     # The second call waits for the first call, so it does not fetch yet.
     second_update_thread.join(timeout=0.1)
     assert second_update_thread.is_alive()
@@ -246,7 +298,7 @@ def test_failed_update_keeps_old_state(redis):
     node = RingNode(redis, TEST_KEY, n_replicas=1)
     own_replica = node._replicas[0][1]
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
-    node.update()
+    node._update()
 
     # The name of the second replica is malformed. The update computes the
     # first range, and then fails.
@@ -254,7 +306,7 @@ def test_failed_update_keeps_old_state(redis):
         return_value=[(0, own_replica), (2**31, "malformed")]
     )
     with pytest.raises(ValueError):
-        node.update()
+        node._update()
 
     assert node.get_ranges() == ((0, RING_SIZE),)
     assert node.get_node_count() == 1
@@ -267,10 +319,10 @@ def test_remove_waits_for_update(redis):
     fetch_ring = BlockingFetch([(0, own_replica)])
     node._fetch_ring = fetch_ring
 
-    update_thread = start_thread(node.update)
+    update_thread = start_thread(node._update)
     assert fetch_ring.started.wait(timeout=5)
-    remove_thread = start_thread(node.remove)
-    # `remove` waits for `update`, so the node is still in the ring.
+    remove_thread = start_thread(node._remove)
+    # `_remove` waits for `_update`, so the node is still in the ring.
     remove_thread.join(timeout=0.1)
     assert remove_thread.is_alive()
     assert redis.zcard(TEST_KEY) == 1
@@ -286,13 +338,13 @@ def test_remove_waits_for_update(redis):
 
 def test_remove_clears_state_when_zrem_fails(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
-    node.update()
+    node._update()
 
     with patch(
         "redis.client.Pipeline.execute", side_effect=RedisConnectionError()
     ):
         with pytest.raises(RedisConnectionError):
-            node.remove()
+            node._remove()
 
     assert node.get_ranges() == ()
     assert node.get_node_count() == 0
@@ -311,7 +363,7 @@ def test_start_reads_subscription_reply_before_update(redis):
     node = RingNode(redis, TEST_KEY)
     events = []
     original_get_message = PubSub.get_message
-    original_update = node.update
+    original_update = node._update
 
     def get_message(pubsub, *args, **kwargs):
         message = original_get_message(pubsub, *args, **kwargs)
@@ -326,11 +378,11 @@ def test_start_reads_subscription_reply_before_update(redis):
     with patch.object(
         PubSub, "get_message", autospec=True, side_effect=get_message
     ):
-        with patch.object(node, "update", side_effect=update):
+        with patch.object(node, "_update", side_effect=update):
             with node:
                 pass
 
-    # The setup reads the reply to the subscription before it runs `update`.
+    # The setup reads the reply to the subscription before it runs `_update`.
     assert events[:2] == ["subscribe", "update"]
 
 
@@ -343,7 +395,7 @@ def test_start_raises_when_subscription_gets_no_reply(redis):
             node.start()
 
     # The setup waits for the reply with a limit.
-    get_message.assert_called_once_with(timeout=SUBSCRIBE_TIMEOUT)
+    get_message.assert_called_once_with(timeout=_ring_node.SUBSCRIBE_TIMEOUT)
     assert set(threading.enumerate()) <= threads_before
     assert node._polling_thread is None
     # The setup failed before it wrote to the ring.
@@ -378,7 +430,7 @@ def test_start_raises_when_setup_fails(redis):
     with patch.object(
         PubSub, "close", autospec=True, side_effect=original_close
     ) as close:
-        with patch.object(node, "heartbeat", side_effect=error):
+        with patch.object(node, "_heartbeat", side_effect=error):
             with pytest.raises(RedisConnectionError) as exc_info:
                 node.start()
 
@@ -394,7 +446,7 @@ def test_start_raises_when_setup_fails(redis):
 
 def test_start_after_failed_start(redis):
     node = RingNode(redis, TEST_KEY)
-    with patch.object(node, "heartbeat", side_effect=RedisConnectionError()):
+    with patch.object(node, "_heartbeat", side_effect=RedisConnectionError()):
         with pytest.raises(RedisConnectionError):
             node.start()
 
@@ -424,7 +476,7 @@ def test_failed_start_leaves_the_ring(redis):
     node = RingNode(redis, TEST_KEY)
 
     # The setup fails after the node joined the ring and got its ranges.
-    with patch.object(node, "cleanup", side_effect=RedisConnectionError()):
+    with patch.object(node, "_cleanup", side_effect=RedisConnectionError()):
         with pytest.raises(RedisConnectionError):
             node.start()
 
@@ -436,7 +488,7 @@ def test_failed_start_leaves_the_ring(redis):
 def test_failed_heartbeat_leaves_the_ring(redis):
     node = RingNode(redis, TEST_KEY)
 
-    # `heartbeat` adds the replicas, and then fails to notify the other
+    # `_heartbeat` adds the replicas, and then fails to notify the other
     # nodes.
     with patch.object(node, "_notify", side_effect=RedisConnectionError()):
         with pytest.raises(RedisConnectionError):
@@ -449,7 +501,7 @@ def test_failed_start_before_heartbeat_does_not_remove(redis):
     node = RingNode(redis, TEST_KEY)
 
     with patch.object(PubSub, "subscribe", side_effect=RedisConnectionError()):
-        with patch.object(node, "remove") as remove:
+        with patch.object(node, "_remove") as remove:
             with pytest.raises(RedisConnectionError):
                 node.start()
 
@@ -461,8 +513,8 @@ def test_start_raises_setup_error_when_remove_fails(redis):
     node = RingNode(redis, TEST_KEY)
     error = RedisConnectionError()
 
-    with patch.object(node, "heartbeat", side_effect=error):
-        with patch.object(node, "remove", side_effect=RedisConnectionError()):
+    with patch.object(node, "_heartbeat", side_effect=error):
+        with patch.object(node, "_remove", side_effect=RedisConnectionError()):
             with pytest.raises(RedisConnectionError) as exc_info:
                 node.start()
 
@@ -568,7 +620,7 @@ def short_intervals():
     after each error.
     """
     with patch.multiple(
-        redis_hashring,
+        _ring_node,
         POLL_INTERVAL=0.1,
         RETRY_INTERVAL_MIN=0.1,
         RETRY_INTERVAL_MAX=0.1,
@@ -580,8 +632,8 @@ def short_intervals():
 def test_thread_reports_errors(redis):
     with patch.object(threading, "excepthook") as excepthook:
         with RingNode(redis, TEST_KEY) as node:
-            heartbeat = FailingCall(node.heartbeat, failures_left=1)
-            node.heartbeat = heartbeat
+            heartbeat = FailingCall(node._heartbeat, failures_left=1)
+            node._heartbeat = heartbeat
             wait_for(lambda: heartbeat.success_count > 0)
 
     excepthook.assert_called_once()
@@ -597,8 +649,8 @@ def test_thread_survives_failed_excepthook(redis):
         threading, "excepthook", side_effect=RuntimeError()
     ) as excepthook:
         with RingNode(redis, TEST_KEY) as node:
-            heartbeat = FailingCall(node.heartbeat, failures_left=1)
-            node.heartbeat = heartbeat
+            heartbeat = FailingCall(node._heartbeat, failures_left=1)
+            node._heartbeat = heartbeat
 
             # The thread tries again, and the next heartbeat works.
             wait_for(lambda: heartbeat.success_count > 0)
@@ -611,7 +663,7 @@ def test_thread_survives_failed_excepthook(redis):
 # the ring during the test.
 @ignore_thread_errors
 @patch.multiple(
-    redis_hashring,
+    _ring_node,
     RETRY_INTERVAL_MIN=0.1,
     RETRY_INTERVAL_MAX=0.1,
 )
@@ -620,7 +672,7 @@ def test_thread_survives_closed_pubsub_connection(redis):
         resubscribed = threading.Event()
         ring_read_after_resubscribe = threading.Event()
         original_subscribe = node1._subscribe
-        original_update = node1.update
+        original_update = node1._update
 
         def subscribe():
             pubsub = original_subscribe()
@@ -633,7 +685,7 @@ def test_thread_survives_closed_pubsub_connection(redis):
                 ring_read_after_resubscribe.set()
 
         node1._subscribe = subscribe
-        node1.update = update
+        node1._update = update
 
         client_ids = get_pubsub_client_ids(redis)
         assert len(client_ids) == 1, client_ids
@@ -649,9 +701,9 @@ def test_thread_survives_closed_pubsub_connection(redis):
         # ring again, and see node 2 join.
         with patch.object(socket, "gethostname", return_value="host2"):
             node2 = RingNode(redis, TEST_KEY)
-        node2.heartbeat()
+        node2._heartbeat()
         wait_for(lambda: node1.get_node_count() == 2)
-        node2.remove()
+        node2._remove()
 
 
 @ignore_thread_errors
@@ -659,8 +711,8 @@ def test_thread_survives_closed_pubsub_connection(redis):
 def test_thread_survives_failed_heartbeat(redis):
     with RingNode(redis, TEST_KEY) as node:
         ranges = node.get_ranges()
-        heartbeat = FailingCall(node.heartbeat, failures_left=1)
-        node.heartbeat = heartbeat
+        heartbeat = FailingCall(node._heartbeat, failures_left=1)
+        node._heartbeat = heartbeat
 
         # The thread tries again, and the next heartbeat works.
         wait_for(lambda: heartbeat.success_count > 0)
@@ -671,12 +723,12 @@ def test_thread_survives_failed_heartbeat(redis):
 
 @ignore_thread_errors
 @pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT", 0.5)
+@patch.object(_ring_node, "NODE_TIMEOUT", 0.5)
 def test_node_gives_up_keys_without_heartbeats(redis):
     with RingNode(redis, TEST_KEY) as node:
         ranges = node.get_ranges()
-        heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-        node.heartbeat = heartbeat
+        heartbeat = FailingCall(node._heartbeat, failures_left=math.inf)
+        node._heartbeat = heartbeat
 
         # After 0.4 s without a heartbeat, the node owns no keys.
         wait_for(lambda: node.get_ranges() == ())
@@ -689,12 +741,12 @@ def test_node_gives_up_keys_without_heartbeats(redis):
 
 
 @pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT", 0.5)
+@patch.object(_ring_node, "NODE_TIMEOUT", 0.5)
 def test_node_gives_up_keys_while_heartbeat_blocks(redis):
     with RingNode(redis, TEST_KEY) as node:
         ranges = node.get_ranges()
-        heartbeat = BlockingCall(node.heartbeat)
-        node.heartbeat = heartbeat
+        heartbeat = BlockingCall(node._heartbeat)
+        node._heartbeat = heartbeat
         # The number of heartbeats at each notice.
         notices = []
         original_notify = node._notify
@@ -707,7 +759,7 @@ def test_node_gives_up_keys_while_heartbeat_blocks(redis):
 
         try:
             assert heartbeat.started.wait(timeout=5)
-            # The thread waits in `heartbeat`. After the deadline of 0.4 s,
+            # The thread waits in `_heartbeat`. After the deadline of 0.4 s,
             # readers see no keys.
             wait_for(lambda: node.get_ranges() == ())
             assert node.get_node_count() == 0
@@ -724,20 +776,20 @@ def test_node_gives_up_keys_while_heartbeat_blocks(redis):
 
 @ignore_thread_errors
 @pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT", 0.5)
+@patch.object(_ring_node, "NODE_TIMEOUT", 0.5)
 def test_node_gives_up_keys_while_update_fails(redis):
     with RingNode(redis, TEST_KEY) as node:
         ranges = node.get_ranges()
         # Count the heartbeats. All of them work.
-        heartbeat = FailingCall(node.heartbeat, failures_left=0)
-        node.heartbeat = heartbeat
+        heartbeat = FailingCall(node._heartbeat, failures_left=0)
+        node._heartbeat = heartbeat
         fetch_ring = FailingCall(node._fetch_ring, failures_left=math.inf)
         node._fetch_ring = fetch_ring
 
-        # No `update` works after the heartbeats. After 0.4 s, the node owns
+        # No `_update` works after the heartbeats. After 0.4 s, the node owns
         # no keys.
         wait_for(lambda: node.get_ranges() == ())
-        # More heartbeats without a successful `update` do not give the keys
+        # More heartbeats without a successful `_update` do not give the keys
         # back.
         heartbeat_count = heartbeat.success_count
         wait_for(lambda: heartbeat.success_count >= heartbeat_count + 3)
@@ -745,33 +797,37 @@ def test_node_gives_up_keys_while_update_fails(redis):
         assert node.get_node_count() == 0
         assert node.contains("item") is False
 
-        # When `update` works again, the node gets its keys back.
+        # When `_update` works again, the node gets its keys back.
         fetch_ring.heal()
         wait_for(lambda: node.get_ranges() == ranges)
 
 
+# Between `stop` and the next `start`, only private methods can set the state
+# of the node, so no user sees this behavior. The test keeps it as an
+# invariant: the deadline applies only while the thread runs. Thus, after
+# `stop`, the node acts as a node that never started.
 @ignore_thread_errors
 @pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT", 0.5)
+@patch.object(_ring_node, "NODE_TIMEOUT", 0.5)
 def test_thread_resets_deadline_when_it_exits(redis):
     node = RingNode(redis, TEST_KEY)
     with node:
-        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        node._heartbeat = FailingCall(node._heartbeat, failures_left=math.inf)
         # The deadline passes, so readers see no keys.
         wait_for(lambda: node.get_ranges() == ())
-    # Use the real `heartbeat` again.
-    del node.heartbeat
+    # Use the real `_heartbeat` again.
+    del node._heartbeat
 
     # Without the thread, no deadline applies to the state.
-    node.heartbeat()
-    node.update()
+    node._heartbeat()
+    node._update()
     assert node.get_node_count() == 1
     assert node.contains("item") is True
 
 
 @ignore_thread_errors
 @pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT", 0.5)
+@patch.object(_ring_node, "NODE_TIMEOUT", 0.5)
 def test_node_notifies_other_nodes_when_it_joins_again(redis):
     pubsub = redis.pubsub()
     try:
@@ -779,8 +835,8 @@ def test_node_notifies_other_nodes_when_it_joins_again(redis):
         assert pubsub.get_message(timeout=5)["type"] == "subscribe"
 
         with RingNode(redis, TEST_KEY) as node:
-            heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-            node.heartbeat = heartbeat
+            heartbeat = FailingCall(node._heartbeat, failures_left=math.inf)
+            node._heartbeat = heartbeat
             wait_for(lambda: node.get_ranges() == ())
             # Drop the notices from before the outage.
             while pubsub.get_message() is not None:
@@ -805,11 +861,11 @@ def test_node_reads_ring_after_each_heartbeat(redis):
         wait_for(lambda: node.get_node_count() == 2)
 
 
-# Keep the default `POLL_INTERVAL`, so that the first failed `update` comes
+# Keep the default `POLL_INTERVAL`, so that the first failed `_update` comes
 # from a notice, not from a heartbeat.
 @ignore_thread_errors
 @patch.multiple(
-    redis_hashring,
+    _ring_node,
     RETRY_INTERVAL_MIN=0.1,
     RETRY_INTERVAL_MAX=0.1,
 )
@@ -821,7 +877,7 @@ def test_thread_survives_failed_update(redis):
         # Node 1 cannot read the ring after node 2 joins.
         with patch.object(socket, "gethostname", return_value="host2"):
             node2 = RingNode(redis, TEST_KEY)
-        node2.heartbeat()
+        node2._heartbeat()
         wait_for(lambda: fetch_ring.failure_count > 0)
         assert node1.get_node_count() == 1
 
@@ -829,12 +885,12 @@ def test_thread_survives_failed_update(redis):
         fetch_ring.heal()
         wait_for(lambda: node1.get_node_count() == 2)
         assert node1._polling_thread.is_alive()
-        node2.remove()
+        node2._remove()
 
 
 @ignore_thread_errors
-@patch.object(redis_hashring, "POLL_INTERVAL", 0.1)
-@patch.object(redis_hashring, "RETRY_INTERVAL_MIN", 10)
+@patch.object(_ring_node, "POLL_INTERVAL", 0.1)
+@patch.object(_ring_node, "RETRY_INTERVAL_MIN", 10)
 def test_stop_while_heartbeat_fails(redis):
     node = RingNode(redis, TEST_KEY)
     node.start()
@@ -847,7 +903,7 @@ def test_stop_while_heartbeat_fails(redis):
             original_wait_before_retry(retry_interval)
 
         node._wait_before_retry = wait_before_retry
-        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        node._heartbeat = FailingCall(node._heartbeat, failures_left=math.inf)
         # After the first failure, the thread waits at least 5 s before it
         # tries again.
         assert retry_wait_started.wait(timeout=5)
@@ -874,8 +930,8 @@ def test_thread_exits_when_stop_arrives_during_subscription(redis):
 
         node._subscribe = subscribe
         # The failed heartbeat makes the thread subscribe again.
-        heartbeat = FailingCall(node.heartbeat, failures_left=1)
-        node.heartbeat = heartbeat
+        heartbeat = FailingCall(node._heartbeat, failures_left=1)
+        node._heartbeat = heartbeat
 
         # The thread exits after the subscription, and sends no heartbeat.
         join_thread(node._polling_thread)
@@ -888,7 +944,7 @@ def test_thread_exits_when_stop_arrives_during_subscription(redis):
 # `join_thread`.
 @ignore_thread_errors
 @patch.multiple(
-    redis_hashring,
+    _ring_node,
     STOP_CHECK_INTERVAL=10,
     RETRY_INTERVAL_MIN=0.1,
     RETRY_INTERVAL_MAX=0.1,
@@ -896,13 +952,13 @@ def test_thread_exits_when_stop_arrives_during_subscription(redis):
 def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     node = RingNode(redis, TEST_KEY)
     node.start()
-    heartbeat = BlockingCall(node.heartbeat)
-    update = FailingCall(node.update, failures_left=1)
+    heartbeat = BlockingCall(node._heartbeat)
+    update = FailingCall(node._update, failures_left=1)
     try:
-        node.heartbeat = heartbeat
+        node._heartbeat = heartbeat
         # The failed update makes the thread subscribe again, and then send a
         # heartbeat.
-        node.update = update
+        node._update = update
         redis.publish(TEST_KEY, "*")
         assert heartbeat.started.wait(timeout=5)
     except BaseException:
@@ -922,3 +978,133 @@ def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     join_thread(stop_thread)
     assert update.failure_count == 1
     assert update.success_count == 0
+
+
+def test_command_prints_ring(redis, capsys, monkeypatch):
+    with patch.object(socket, "gethostname", return_value="host1"):
+        node = get_node(redis, 2, 2, HashAlgorithm.XXHASH)
+    # The default URL points to the Redis server of the tests.
+    monkeypatch.delenv("REDIS_HASHRING_URL", raising=False)
+
+    _main([TEST_KEY])
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 10, lines
+    assert lines[0] == "Redis server: localhost:6379, database 0"
+    assert lines[2] == f'Hash ring "{TEST_KEY}" replicas:'
+    # One line per replica, sorted by the start of the replica.
+    printed_replicas = []
+    for line in lines[4:6]:
+        start, _, _, replica = line.split()
+        printed_replicas.append((int(start), replica))
+    assert printed_replicas == sorted(node._replicas)
+
+    assert lines[7] == f'Hash ring "{TEST_KEY}" nodes:'
+    # The only node owns the whole ring with its 2 replicas.
+    ring_share, replica_count, _, hostname, _ = lines[9].split()
+    assert (ring_share, replica_count, hostname) == ("100.00%", "2", "host1")
+
+
+def test_command_reads_url_from_environment(redis, capsys, monkeypatch):
+    get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    # The ring is in database 0, and database 1 has no replicas.
+    monkeypatch.setenv("REDIS_HASHRING_URL", "redis://localhost:6379/1")
+
+    _main([TEST_KEY])
+
+    output = capsys.readouterr().out
+    assert output.startswith("Redis server: localhost:6379, database 1\n")
+    assert "(no replicas)" in output
+
+
+def test_command_ignores_empty_url_in_environment(redis, capsys, monkeypatch):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    monkeypatch.setenv("REDIS_HASHRING_URL", "")
+
+    _main([TEST_KEY])
+
+    # The command uses the default URL.
+    output = capsys.readouterr().out
+    assert output.startswith("Redis server: localhost:6379, database 0\n")
+    assert node._replicas[0][1] in output
+
+
+def test_command_prefers_url_option_over_environment(
+    redis, capsys, monkeypatch
+):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    # The ring is in database 0, and database 1 has no replicas.
+    monkeypatch.setenv("REDIS_HASHRING_URL", "redis://localhost:6379/1")
+
+    _main(["--url", "redis://localhost:6379/0", TEST_KEY])
+
+    output = capsys.readouterr().out
+    assert output.startswith("Redis server: localhost:6379, database 0\n")
+    assert node._replicas[0][1] in output
+
+
+@pytest.mark.parametrize(
+    "url, description",
+    [
+        (
+            "redis://user:secret@example.com:1234/5",
+            "example.com:1234, database 5",
+        ),
+        ("redis://:secret@example.com", "example.com:6379, database 0"),
+        (
+            "redis://example.com/3?password=secret",
+            "example.com:6379, database 3",
+        ),
+        (
+            "unix://:secret@/tmp/redis.sock?db=2",
+            "/tmp/redis.sock, database 2",
+        ),
+    ],
+)
+def test_command_shows_server_without_credentials(url, description):
+    # `Redis.from_url` does not connect, so the servers need not exist.
+    assert _describe_server(Redis.from_url(url)) == description
+
+
+@pytest.mark.parametrize(
+    "url, socket_timeout",
+    [
+        # The README states the default value.
+        ("redis://example.com", 10),
+        ("unix:///tmp/redis.sock", 10),
+        # An option in the URL takes priority.
+        ("redis://example.com?socket_timeout=2.5", 2.5),
+    ],
+)
+def test_command_sets_socket_timeout(url, socket_timeout):
+    # `make_connection` does not connect, so the servers need not exist.
+    connection = _connect(url).connection_pool.make_connection()
+    assert connection.socket_timeout == socket_timeout
+    assert connection.socket_connect_timeout == socket_timeout
+
+
+def test_command_runs_as_module(redis):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "redis_hashring",
+            "--url",
+            "redis://localhost:6379/0",
+            TEST_KEY,
+        ],
+        # Run from the directory of the tests, so that Python imports the
+        # package of this repository.
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith(
+        "Redis server: localhost:6379, database 0\n"
+    )
+    assert node._replicas[0][1] in result.stdout

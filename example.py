@@ -22,12 +22,6 @@ def _parse_arguments():
         "--port", "-p", type=int, default=6379, help="Redis port."
     )
     parser.add_argument(
-        "--print",
-        action="store_true",
-        dest="print",
-        help="Print the hash ring.",
-    )
-    parser.add_argument(
         "--help",
         action="help",
         default=argparse.SUPPRESS,
@@ -48,10 +42,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     node = RingNode(r, "ring")
-
-    if args.print:
-        node.debug_print()
-        sys.exit()
 
     pid = os.getpid()
 
