@@ -220,6 +220,75 @@ except KeyboardInterrupt:
 node.stop()
 ```
 
+## Store the points of keys
+
+`HashAlgorithm.ring_point()` returns the point of a key on the ring.
+`RingNode.get_ranges()` returns the ranges of points that a node owns. Each
+range (a, b) holds the points N with a <= N < b. Thus, an application can store
+the point of each key in a database, and then query the keys of a node.
+
+The point of a key depends only on the key and the hash algorithm. Thus, a
+stored point stays valid when nodes join or leave the ring. Only the ranges
+change.
+
+A point can be as large as 2^32-1, and the end of a range can be 2^32. These
+values do not fit in a signed 32-bit integer column. To store the points, use a
+64-bit integer column, for example `BIGINT`.
+
+Call `ring_point()` on the hash algorithm of the nodes. Another algorithm gives
+other points. If the code has a node, read the algorithm from
+`node.hash_algorithm`. Otherwise, keep the algorithm in one constant, and use
+it for the nodes and for the points.
+
+This example stores the point of each item in SQLite. Then it reads the items
+that the node owns:
+
+```python
+import sqlite3
+
+from redis import Redis
+from redis_hashring import HashAlgorithm, RingNode
+
+KEY = "example-ring"
+HASH_ALGORITHM = HashAlgorithm.XXHASH
+
+database = sqlite3.connect("example.db")
+database.execute(
+    "CREATE TABLE IF NOT EXISTS item (key TEXT PRIMARY KEY, point BIGINT)"
+)
+
+
+def add_item(key):
+    point = HASH_ALGORITHM.ring_point(key)
+    # The block commits the insert. Then other connections see the item.
+    with database:
+        database.execute(
+            "INSERT OR REPLACE INTO item VALUES (?, ?)", (key, point)
+        )
+
+
+def get_node_items(node):
+    """
+    Return the keys of the items that `node` owns.
+    """
+    ranges = node.get_ranges()
+    # A node without ranges owns no items.
+    if not ranges:
+        return []
+    # The condition holds only placeholders. The values go in `parameters`.
+    condition = " OR ".join("(point >= ? AND point < ?)" for _ in ranges)
+    parameters = [bound for ring_range in ranges for bound in ring_range]
+    rows = database.execute(
+        f"SELECT key FROM item WHERE {condition}", parameters
+    )
+    return [key for (key,) in rows]
+
+
+with RingNode(Redis(), KEY, hash_algorithm=HASH_ALGORITHM) as node:
+    add_item("hello")
+    print(get_node_items(node))
+```
+
 ## Implementation considerations
 
 When implementing a distributed application using `redis-hashring`, be aware of

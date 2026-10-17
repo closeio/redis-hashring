@@ -1,3 +1,5 @@
+import binascii
+import inspect
 import itertools
 import logging
 import math
@@ -11,6 +13,7 @@ import time
 from unittest.mock import Mock, patch
 
 import pytest
+import xxhash
 from redis import Redis
 from redis.client import PubSub
 from redis.exceptions import (
@@ -19,8 +22,9 @@ from redis.exceptions import (
 )
 
 import redis_hashring
-from redis_hashring import RING_SIZE, HashAlgorithm, RingNode, _ring_node
+from redis_hashring import HashAlgorithm, RingNode, _ring_node
 from redis_hashring.__main__ import _connect, _describe_server, _main
+from redis_hashring._ring_node import RING_SIZE
 
 TEST_KEY = "hashring-test"
 
@@ -114,6 +118,92 @@ def test_contains(redis, hash_algorithm):
     assert node1.contains("item") is False
 
 
+@pytest.mark.parametrize(
+    "hash_algorithm", [HashAlgorithm.CRC32, HashAlgorithm.XXHASH]
+)
+def test_contains_uses_hash_algorithm(redis, hash_algorithm):
+    node = RingNode(
+        redis, TEST_KEY, n_replicas=1, hash_algorithm=hash_algorithm
+    )
+    own_replica = node._replicas[0][1]
+    node._fetch_ring = Mock(
+        return_value=[(0, own_replica), (2**31, OTHER_REPLICA)]
+    )
+    node._update()
+    assert node.get_ranges() == ((0, 2**31),)
+
+    for n in range(100):
+        key = str(n)
+        expected = hash_algorithm.ring_point(key) < 2**31
+        assert node.contains(key) is expected
+
+
+# Check published reference values of CRC-32 and xxHash32, and the point that
+# the README states. All nodes of a ring must agree on the point of each key,
+# in all releases. Applications can also store the points. Thus, the points
+# must not change.
+@pytest.mark.parametrize(
+    "hash_algorithm, key, point",
+    [
+        (HashAlgorithm.CRC32, "", 0),
+        (HashAlgorithm.CRC32, "123456789", 0xCBF43926),
+        (
+            HashAlgorithm.CRC32,
+            "The quick brown fox jumps over the lazy dog",
+            0x414FA339,
+        ),
+        (HashAlgorithm.CRC32, "hello", 0x3610A686),
+        (HashAlgorithm.XXHASH, "", 0x02CC5D05),
+        (
+            HashAlgorithm.XXHASH,
+            "Nobody inspects the spammish repetition",
+            0xE2293B2F,
+        ),
+        # The README states this point.
+        (HashAlgorithm.XXHASH, "hello", 4_211_111_929),
+    ],
+)
+def test_ring_point(hash_algorithm, key, point):
+    assert hash_algorithm.ring_point(key) == point
+
+
+def test_ring_point_encodes_keys_as_utf8():
+    # "é" is b"\xc3\xa9" in UTF-8, and b"\xe9" in Latin-1.
+    assert HashAlgorithm.CRC32.ring_point("é") == binascii.crc32(b"\xc3\xa9")
+    assert (
+        HashAlgorithm.XXHASH.ring_point("é")
+        == xxhash.xxh32(b"\xc3\xa9").intdigest()
+    )
+
+
+def test_xxhash_missing(redis):
+    with patch.object(_ring_node, "xxhash", None):
+        with pytest.raises(ImportError):
+            HashAlgorithm.XXHASH.ring_point("item")
+        # The node raises when it is created, not at the first `contains`.
+        with pytest.raises(ImportError):
+            RingNode(redis, TEST_KEY)
+
+        # CRC-32 needs no library.
+        point = HashAlgorithm.CRC32.ring_point("item")
+        assert point == binascii.crc32(b"item")
+        RingNode(redis, TEST_KEY, hash_algorithm=HashAlgorithm.CRC32)
+
+
+def test_unknown_hash_algorithm(redis):
+    with pytest.raises(ValueError):
+        RingNode(redis, TEST_KEY, hash_algorithm="crc32")
+
+
+def test_hash_algorithm(redis):
+    assert RingNode(redis, TEST_KEY).hash_algorithm is HashAlgorithm.XXHASH
+    node = RingNode(redis, TEST_KEY, hash_algorithm=HashAlgorithm.CRC32)
+    assert node.hash_algorithm is HashAlgorithm.CRC32
+    # The property has no setter.
+    with pytest.raises(AttributeError):
+        node.hash_algorithm = HashAlgorithm.XXHASH
+
+
 def public_names(namespace):
     """
     Return the names in `namespace` that do not start with `_`.
@@ -122,29 +212,37 @@ def public_names(namespace):
 
 
 def test_public_api():
-    assert public_names(redis_hashring) == {
-        "RING_SIZE",
-        "HashAlgorithm",
-        "RingNode",
-    }
+    assert public_names(redis_hashring) == {"HashAlgorithm", "RingNode"}
     assert set(redis_hashring.__all__) == public_names(redis_hashring)
     assert public_names(RingNode) == {
         "contains",
         "get_node_count",
         "get_ranges",
-        "key_as_ring_point",
+        "hash_algorithm",
         "start",
         "stop",
     }
+    parameters = inspect.signature(RingNode).parameters.values()
+    assert [(parameter.name, parameter.kind) for parameter in parameters] == [
+        ("conn", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        ("key", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        ("n_replicas", inspect.Parameter.KEYWORD_ONLY),
+        ("hash_algorithm", inspect.Parameter.KEYWORD_ONLY),
+    ]
     # The node is also a context manager.
     assert hasattr(RingNode, "__enter__")
     assert hasattr(RingNode, "__exit__")
     members = {member.name: member.value for member in HashAlgorithm}
     assert members == {"CRC32": "crc32", "XXHASH": "xxhash"}
+    # `dir` of an enum class lists only its members. Thus, read the names
+    # from the class.
+    names = {name for name in vars(HashAlgorithm) if not name.startswith("_")}
+    assert names - set(HashAlgorithm.__members__) == {"ring_point"}
 
 
 # Read the values when the module loads, before the fixtures patch them.
 DOCUMENTED_VALUES = {
+    "RING_SIZE": _ring_node.RING_SIZE,
     "POLL_INTERVAL": _ring_node.POLL_INTERVAL,
     "NODE_TIMEOUT": _ring_node.NODE_TIMEOUT,
     "SUBSCRIBE_TIMEOUT": _ring_node.SUBSCRIBE_TIMEOUT,
@@ -155,9 +253,10 @@ DOCUMENTED_VALUES = {
 
 
 def test_documented_values():
-    # The README and the docstrings of `RingNode` state these values. If this
-    # test fails, update the text, and then this test.
+    # The README and the docstrings state these values. If this test fails,
+    # update the text, and then this test.
     assert DOCUMENTED_VALUES == {
+        "RING_SIZE": 2**32,
         "POLL_INTERVAL": 10,
         "NODE_TIMEOUT": 60,
         "SUBSCRIBE_TIMEOUT": 10,
@@ -167,13 +266,13 @@ def test_documented_values():
     }
 
 
-def find_key(node, start, end):
+def find_key(hash_algorithm, start, end):
     """
     Return a key whose ring point is in the range [start, end).
     """
     for n in itertools.count():
         key = str(n)
-        if start <= node.key_as_ring_point(key) < end:
+        if start <= hash_algorithm.ring_point(key) < end:
             return key
 
 
@@ -244,10 +343,12 @@ def test_get_ranges_returns_tuple(redis):
 
 
 def test_readers_see_old_state_during_update(redis):
-    node = RingNode(redis, TEST_KEY, n_replicas=1)
+    node = RingNode(
+        redis, TEST_KEY, n_replicas=1, hash_algorithm=HashAlgorithm.XXHASH
+    )
     own_replica = node._replicas[0][1]
     # A key that the node owns before the update, and not after it.
-    key = find_key(node, 2**31, RING_SIZE)
+    key = find_key(HashAlgorithm.XXHASH, 2**31, RING_SIZE)
 
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
     node._update()
