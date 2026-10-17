@@ -17,7 +17,9 @@ try:
 except ImportError:
     xxhash = None
 
-# Amount of points on the ring. Must not be higher than 2**32.
+# Amount of points on the ring. Do not change this value. All nodes of a
+# ring, in all releases, must agree on the point of each key. Applications
+# can also store these points. The README and the docstrings state this value.
 RING_SIZE = 2**32
 
 # Default amount of replicas per node.
@@ -25,8 +27,32 @@ RING_REPLICAS = 16
 
 
 class HashAlgorithm(enum.Enum):
+    """
+    The hash function that gives the point of a key on the ring.
+
+    All nodes of a ring must use the same algorithm.
+    """
+
     CRC32 = "crc32"
     XXHASH = "xxhash"
+
+    def ring_point(self, key):
+        """
+        Return the point of `key` on the ring.
+
+        `key` must be a `str`. The point is an integer N with 0 <= N < 2**32.
+        Compare it with the ranges from `RingNode.get_ranges`.
+
+        For `XXHASH`, raise `ImportError` if the `xxhash` library is not
+        installed.
+        """
+        data = key.encode()
+        if self is HashAlgorithm.XXHASH:
+            _check_xxhash()
+            return xxhash.xxh32_intdigest(data) % RING_SIZE
+        if self is HashAlgorithm.CRC32:
+            return binascii.crc32(data) % RING_SIZE
+        raise ValueError(f"No hash function for {self!r}")
 
 
 # The README and the docstrings of `RingNode` state some of the values below
@@ -69,12 +95,15 @@ _EMPTY_STATE = _RingState(ranges=(), node_count=0)
 _logger = logging.getLogger("redis_hashring")
 
 
-def _hash_with_xxhash(key):
-    return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
-
-
-def _hash_with_crc32(key):
-    return binascii.crc32(key.encode()) % RING_SIZE
+def _check_xxhash():
+    """
+    Raise `ImportError` if the `xxhash` library is not installed.
+    """
+    if xxhash is None:
+        raise ImportError(
+            "xxhash library is required for XXHASH algorithm. "
+            "Install with: pip install redis-hashring[xxhash]"
+        )
 
 
 def _decode(data):
@@ -144,9 +173,8 @@ class RingNode(object):
     node.start()
 
     while is_running:
-        # Only process items this node is responsible for. `item` should be an
-        # object that can be encoded to bytes by calling `item.encode()` on it,
-        # like a `str`.
+        # Only process items this node is responsible for. `item` must be a
+        # `str`.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 
@@ -168,9 +196,8 @@ class RingNode(object):
     ```
     with RingNode(redis, key) as node:
         while is_running:
-            # Only process items this node is responsible for. `item` should be
-            # an object that can be encoded to bytes by calling `item.encode()`
-            # on it, like a `str`.
+            # Only process items this node is responsible for. `item` must be
+            # a `str`.
             items = [item for item in get_items() if node.contains(item)]
             process_items(items)
     ```
@@ -189,7 +216,8 @@ class RingNode(object):
 
         Args:
             conn: The Redis connection to use.
-            key: A key to use for this node.
+            key: The Redis key of the ring. All nodes of the ring use the same
+                key.
             n_replicas: Number of replicas this node should have on the ring.
             hash_algorithm: Hash algorithm to use. It is recommended to use
                 `HashAlgorithm.XXHASH` (the default) because it provides better
@@ -208,17 +236,12 @@ class RingNode(object):
         self._conn = conn
         self._key = key
 
-        if hash_algorithm is HashAlgorithm.XXHASH:
-            if xxhash is None:
-                raise ImportError(
-                    "xxhash library is required for XXHASH algorithm. "
-                    "Install with: pip install redis-hashring[xxhash]"
-                )
-            self._hash_function = _hash_with_xxhash
-        elif hash_algorithm is HashAlgorithm.CRC32:
-            self._hash_function = _hash_with_crc32
-        else:
+        if not isinstance(hash_algorithm, HashAlgorithm):
             raise ValueError("Unexpected hash algorithm requested")
+        if hash_algorithm is HashAlgorithm.XXHASH:
+            # Raise now, not at the first call to `contains`.
+            _check_xxhash()
+        self._hash_algorithm = hash_algorithm
 
         host = socket.gethostname()
         pid = os.getpid()
@@ -394,12 +417,23 @@ class RingNode(object):
             return _EMPTY_STATE
         return self._state
 
+    @property
+    def hash_algorithm(self):
+        """
+        The `HashAlgorithm` of this node.
+
+        Compare the points from its `ring_point` with the ranges from
+        `get_ranges`.
+        """
+        return self._hash_algorithm
+
     def get_ranges(self):
         """
         Return a tuple of the hash ring ranges that this node owns.
 
         Each range is a tuple (a, b) that includes any ring point N with
-        a <= N < b.
+        a <= N < b. Compare the ranges with the points from
+        `hash_algorithm.ring_point`.
 
         While the node runs, return an empty tuple after 50 seconds without a
         successful heartbeat and a successful read of the ring after it.
@@ -417,21 +451,14 @@ class RingNode(object):
 
     def contains(self, key):
         """
-        Check whether this node is responsible for the item.
+        Check whether this node is responsible for `key`.
+
+        `key` must be a `str`.
 
         While the node runs, return `False` after 50 seconds without a
         successful heartbeat and a successful read of the ring after it.
         """
-        return self._contains_ring_point(self.key_as_ring_point(key))
-
-    def key_as_ring_point(self, key):
-        """
-        Return the point of `key` on the ring.
-
-        The point is an integer N with 0 <= N < `RING_SIZE`. Compare it with
-        the ranges from `get_ranges`.
-        """
-        return self._hash_function(key)
+        return self._contains_ring_point(self._hash_algorithm.ring_point(key))
 
     def _contains_ring_point(self, n):
         """
