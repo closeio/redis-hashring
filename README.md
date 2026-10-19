@@ -158,22 +158,22 @@ Range    Replicas Delay   Hostname             PID
 52.58%       16      0s mbp.local            80808
 ```
 
-## `gevent` example
+## Usage example
 
-`redis-hashring` provides a `GeventRingNode` class for `gevent`-based
-applications. The `GeventRingNode.start()` method spawns a greenlet that
-initializes the ring and periodically updates the node's replicas.
+`RingNode.start()` starts a daemon thread. The thread keeps the node in the
+ring, and updates the ranges of the node when the ring changes.
+`RingNode.stop()` stops the thread and removes the node from the ring.
 
-An example app could look as follows:
+This example app processes only the items that the node owns:
 
 ```python
 from redis import Redis
-from redis_hashring import GeventRingNode
+from redis_hashring import RingNode
 
 KEY = "example-ring"
 
 redis = Redis()
-node = GeventRingNode(redis, KEY)
+node = RingNode(redis, KEY)
 node.start()
 
 
@@ -193,7 +193,7 @@ def process_items(items):
 
 try:
     while True:
-        # Only process items this node is reponsible for.
+        # Only process items this node is responsible for.
         items = [item for item in get_items() if node.contains(item)]
         process_items(items)
 except KeyboardInterrupt:
