@@ -68,10 +68,26 @@ INFO:root:PID 80721, 100 keys ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
 ```
 
 We can print the ring for debugging and see all the nodes and replicas on the
-ring:
+ring. The command `python -m redis_hashring` takes the key of the ring. Its
+option `--url` takes the URL of the Redis server. Without `--url`, the command
+reads the URL from the environment variable `REDIS_HASHRING_URL`. If
+`REDIS_HASHRING_URL` is not set or is empty, the URL is
+`redis://localhost:6379/0`.
+
+If the URL holds a password, set the URL in `REDIS_HASHRING_URL`, not in
+`--url`. Other processes on the host can read the arguments of a command.
+
+The command waits up to 10 seconds for Redis to accept the connection, and
+then for each reply. To change this limit, set the option `socket_timeout` in
+the URL. For example: `redis://localhost:6379/0?socket_timeout=30`.
+
+The first line of the output names the Redis server and the database. It does
+not show the user name or the password.
 
 ```
-% python example.py --print
+% python -m redis_hashring ring
+Redis server: localhost:6379, database 0
+
 Hash ring "ring" replicas:
 Start      Range  Delay   Node
  706234936  2.97%      0s mbp.local:80721:249d729d
@@ -116,7 +132,9 @@ INFO:root:PID 80808, 49 keys ([0, 2, 3, 4, 6, 7, 11, 12, 13, 15, 16, 18, 19, 22,
 We can inspect the ring:
 
 ```
-% python example.py --print
+% python -m redis_hashring ring
+Redis server: localhost:6379, database 0
+
 Hash ring "ring" replicas:
 Start      Range  Delay   Node
  204632062  1.06%      0s mbp.local:80808:f933c33c
