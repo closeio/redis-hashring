@@ -248,12 +248,20 @@ the following:
   an owner for up to about 190 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
-  `stop()`, or after a `start()` call that raises, the node can start again.
+  `stop()`, or after a `start()` call that cannot join the ring, the node can
+  start again.
 
   Only one `start()` or `stop()` call on a node can run at a time. If another
   call on the same node is in progress, both methods raise `RuntimeError`.
   They do not wait for the other call. Thus, a signal handler that calls
   `stop()` during `start()` on the same thread gets an error, not a deadlock.
+
+  If something interrupts `start()`, the thread continues and can join the
+  ring. Examples are `KeyboardInterrupt` and the error of a `stop()` call from
+  a signal handler. Until a call to `stop()`, the node can stay in the ring,
+  and `start()` raises `RuntimeError`. The `with` statement does not call
+  `stop()` in this case, because Python calls `__exit__` only after
+  `__enter__` returns.
 
   `start()` waits up to 10 seconds for Redis to confirm the subscription to
   the channel of the ring. If no reply arrives, `start()` raises
