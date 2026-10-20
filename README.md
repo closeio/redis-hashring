@@ -235,7 +235,7 @@ the following:
   `RingNode.start()` returns when the node is in the ring and has its ranges.
   Thus, `contains()` gives correct results right after `start()`.
 
-  If the node cannot join the ring, `start()` raises the error. For example,
+  If the node cannot join the ring, `start()` raises an error. For example,
   this happens when Redis is not available. Before it raises, `start()` tries
   to remove the replicas that the node added to the ring, if any. If the
   removal also fails, the other nodes ignore these replicas after 60 seconds.
