@@ -229,3 +229,46 @@ the following:
   multiple nodes would need to be running to sync all the accounts. Also note
   that the ring is not usually equally balanced, so running 2 nodes wouldn't be
   enough in this example.
+
+- Startup and shutdown
+
+  `RingNode.start()` returns when the node is in the ring and has its ranges.
+  Thus, `contains()` gives correct results right after `start()`.
+
+  If the node cannot join the ring, `start()` raises an error. For example,
+  this happens when Redis is not available. Before it raises, `start()` tries
+  to remove the replicas that the node added to the ring, if any.
+
+  If the removal also fails, the replicas stay in the ring. The other nodes
+  can count these replicas, and then no node owns the ranges of the replicas.
+  A replica expires 60 seconds after its last heartbeat, but the other nodes
+  see the expiry only when the ring changes. If nothing else changes, the
+  change comes when an active node removes the expired replicas. Each active
+  node does this every 120 to 130 seconds. Thus, the ranges can stay without
+  an owner for up to about 190 seconds after the last heartbeat.
+
+  If the node already started, `start()` raises `RuntimeError`. After
+  `stop()`, or after a `start()` call that cannot join the ring, the node can
+  start again.
+
+  Only one `start()` or `stop()` call on a node can run at a time. If another
+  call on the same node is in progress, both methods raise `RuntimeError`.
+  They do not wait for the other call. Thus, a signal handler that calls
+  `stop()` during `start()` on the same thread gets an error, not a deadlock.
+
+  If something interrupts `start()`, the thread continues and can join the
+  ring. Examples are `KeyboardInterrupt` and the error of a `stop()` call from
+  a signal handler. Until a call to `stop()`, the node can stay in the ring,
+  and `start()` raises `RuntimeError`. The `with` statement does not call
+  `stop()` in this case, because Python calls `__exit__` only after
+  `__enter__` returns.
+
+  `start()` waits up to 10 seconds for Redis to confirm the subscription to
+  the channel of the ring. If no reply arrives, `start()` raises
+  `redis.exceptions.TimeoutError`.
+
+  For the other Redis calls, `start()` and `stop()` have no timeout of their
+  own. `start()` waits for the node to join the ring. `stop()` waits for the
+  Redis call that the thread runs, if any. The socket timeouts of the Redis
+  client limit these waits. Without socket timeouts, both methods can wait
+  forever if Redis does not respond.

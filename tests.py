@@ -1,14 +1,23 @@
 import itertools
+import os
 import socket
 import threading
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 from redis import Redis
-from redis.client import Pipeline
-from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.client import Pipeline, PubSub
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError,
+    TimeoutError as RedisTimeoutError,
+)
 
-from redis_hashring import RING_SIZE, HashAlgorithm, RingNode
+from redis_hashring import (
+    RING_SIZE,
+    SUBSCRIBE_TIMEOUT_SECONDS,
+    HashAlgorithm,
+    RingNode,
+)
 
 TEST_KEY = "hashring-test"
 
@@ -363,3 +372,285 @@ def test_update_keeps_empty_state_after_remove_on_same_thread(redis):
     node.update()
     assert node.get_ranges() == ((0, RING_SIZE),)
     assert node.get_node_count() == 1
+
+
+def test_start_waits_for_ranges(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        ranges = node.get_ranges()
+        assert sum(end - start for start, end in ranges) == RING_SIZE
+        assert node.get_node_count() == 1
+        assert node.contains("item") is True
+
+
+def test_start_reads_subscription_reply_before_update(redis):
+    node = RingNode(redis, TEST_KEY)
+    events = []
+    original_get_message = PubSub.get_message
+    original_update = node.update
+
+    def get_message(pubsub, *args, **kwargs):
+        message = original_get_message(pubsub, *args, **kwargs)
+        if message is not None:
+            events.append(message["type"])
+        return message
+
+    def update():
+        events.append("update")
+        original_update()
+
+    with patch.object(
+        PubSub, "get_message", autospec=True, side_effect=get_message
+    ):
+        with patch.object(node, "update", side_effect=update):
+            with node:
+                pass
+
+    # The setup reads the reply to the subscription before it runs `update`.
+    assert events[:2] == ["subscribe", "update"]
+
+
+def test_start_raises_when_subscription_gets_no_reply(redis):
+    node = RingNode(redis, TEST_KEY)
+    threads_before = set(threading.enumerate())
+
+    with patch.object(PubSub, "get_message", return_value=None) as get_message:
+        with pytest.raises(RedisTimeoutError, match=TEST_KEY):
+            node.start()
+
+    # The setup waits for the reply with a limit.
+    get_message.assert_called_once_with(timeout=SUBSCRIBE_TIMEOUT_SECONDS)
+    assert set(threading.enumerate()) <= threads_before
+    assert node._polling_thread is None
+    # The setup failed before it wrote to the ring.
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_start_twice_raises(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        with pytest.raises(RuntimeError, match="already started"):
+            node.start()
+
+        assert node._polling_thread.is_alive()
+
+
+def test_start_and_stop_raise_during_start_on_other_thread(redis):
+    node = RingNode(redis, TEST_KEY)
+    original_heartbeat = node.heartbeat
+    setup_paused = threading.Event()
+    resume_setup = threading.Event()
+
+    def heartbeat():
+        setup_paused.set()
+        resume_setup.wait()
+        original_heartbeat()
+
+    try:
+        with patch.object(node, "heartbeat", side_effect=heartbeat):
+            first_start_thread = start_thread(node.start)
+            try:
+                assert setup_paused.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="in progress"):
+                    node.stop()
+                with pytest.raises(RuntimeError, match="in progress"):
+                    node.start()
+            finally:
+                # Let the first call end, even if an assertion fails.
+                resume_setup.set()
+                join_thread(first_start_thread)
+
+        # The first call joined the ring.
+        assert node._polling_thread.is_alive()
+        assert node.get_node_count() == 1
+    finally:
+        # Stop the node, so that it does not change the ring in the next
+        # tests.
+        node.stop()
+
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_stop_during_start_on_same_thread_raises(redis):
+    node = RingNode(redis, TEST_KEY)
+    original_wait = node._setup_done.wait
+    nested_errors = []
+
+    def wait_with_nested_stop(*args, **kwargs):
+        # Call `stop` once during `start`, on the same thread, like a signal
+        # handler that interrupts `start`.
+        if not nested_errors:
+            try:
+                node.stop()
+            except RuntimeError as error:
+                nested_errors.append(error)
+            else:
+                nested_errors.append(None)
+        return original_wait(*args, **kwargs)
+
+    try:
+        with patch.object(
+            node._setup_done, "wait", side_effect=wait_with_nested_stop
+        ):
+            # Run `start` on a new thread, so that a deadlock fails the test.
+            join_thread(start_thread(node.start))
+
+        assert len(nested_errors) == 1
+        assert isinstance(nested_errors[0], RuntimeError)
+        assert "in progress" in str(nested_errors[0])
+        # The outer call joined the ring.
+        assert node._polling_thread.is_alive()
+        assert node.get_node_count() == 1
+    finally:
+        # Stop the node, so that it does not change the ring in the next
+        # tests.
+        node.stop()
+
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_start_after_stop(redis):
+    node = RingNode(redis, TEST_KEY)
+    with node:
+        first_polling_thread = node._polling_thread
+    assert not first_polling_thread.is_alive()
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None
+
+    with node:
+        assert node.get_node_count() == 1
+        assert node.contains("item") is True
+
+
+def test_start_raises_when_setup_fails(redis):
+    node = RingNode(redis, TEST_KEY)
+    threads_before = set(threading.enumerate())
+    error = RedisConnectionError()
+    original_close = PubSub.close
+
+    with patch.object(
+        PubSub, "close", autospec=True, side_effect=original_close
+    ) as close:
+        with patch.object(node, "heartbeat", side_effect=error):
+            with pytest.raises(RedisConnectionError) as exc_info:
+                node.start()
+
+    assert exc_info.value is error
+    # The setup closes the pub/sub object that it created.
+    close.assert_called_once()
+    assert set(threading.enumerate()) <= threads_before
+    assert node._polling_thread is None
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None
+    assert node._setup_error is None
+    # No thread runs, so `stop` does not wait.
+    join_thread(start_thread(node.stop))
+
+
+def test_start_after_failed_start(redis):
+    node = RingNode(redis, TEST_KEY)
+    with patch.object(node, "heartbeat", side_effect=RedisConnectionError()):
+        with pytest.raises(RedisConnectionError):
+            node.start()
+
+    with node:
+        assert node.get_node_count() == 1
+        assert node.contains("item") is True
+
+
+def test_start_raises_when_thread_cannot_start(redis):
+    node = RingNode(redis, TEST_KEY)
+    error = RuntimeError("can't start new thread")
+
+    with patch.object(threading.Thread, "start", side_effect=error):
+        with pytest.raises(RuntimeError) as exc_info:
+            node.start()
+
+    assert exc_info.value is error
+    assert node._polling_thread is None
+    # No thread runs, so `stop` does not wait.
+    join_thread(start_thread(node.stop))
+
+    with node:
+        assert node.contains("item") is True
+
+
+def test_failed_start_leaves_the_ring(redis):
+    node = RingNode(redis, TEST_KEY)
+
+    # The setup fails after the node joined the ring and got its ranges.
+    with patch.object(node, "cleanup", side_effect=RedisConnectionError()):
+        with pytest.raises(RedisConnectionError):
+            node.start()
+
+    assert node.get_ranges() == ()
+    assert node.get_node_count() == 0
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_failed_heartbeat_leaves_the_ring(redis):
+    node = RingNode(redis, TEST_KEY)
+
+    # `heartbeat` adds the replicas, and then fails to notify the other
+    # nodes.
+    with patch.object(node, "_notify", side_effect=RedisConnectionError()):
+        with pytest.raises(RedisConnectionError):
+            node.start()
+
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_failed_start_before_heartbeat_does_not_remove(redis):
+    node = RingNode(redis, TEST_KEY)
+
+    with patch.object(PubSub, "subscribe", side_effect=RedisConnectionError()):
+        with patch.object(node, "remove") as remove:
+            with pytest.raises(RedisConnectionError):
+                node.start()
+
+    # The node never wrote to the ring, so it has nothing to remove.
+    remove.assert_not_called()
+
+
+def test_start_raises_setup_error_when_remove_fails(redis):
+    node = RingNode(redis, TEST_KEY)
+    error = RedisConnectionError()
+
+    with patch.object(node, "heartbeat", side_effect=error):
+        with patch.object(node, "remove", side_effect=RedisConnectionError()):
+            with pytest.raises(RedisConnectionError) as exc_info:
+                node.start()
+
+    assert exc_info.value is error
+
+
+# The thread of the node ends with an error. pytest warns about each error
+# that ends a thread.
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+def test_stop_closes_pipe_of_dead_thread(redis):
+    node = RingNode(redis, TEST_KEY)
+    node.start()
+    try:
+        with patch.object(
+            PubSub, "get_message", side_effect=RedisConnectionError()
+        ):
+            # The loop calls `get_message` for this notice, and the thread
+            # dies.
+            redis.publish(TEST_KEY, "*")
+            join_thread(node._polling_thread)
+
+        stop_polling_fd_r = node._stop_polling_fd_r
+        stop_polling_fd_w = node._stop_polling_fd_w
+        with patch.object(os, "close", wraps=os.close) as close:
+            join_thread(start_thread(node.stop))
+    except BaseException:
+        # If an assertion fails, the thread can still run. Stop it, so that
+        # it does not change the ring in the next tests.
+        node.stop()
+        raise
+
+    close.assert_has_calls(
+        [call(stop_polling_fd_r), call(stop_polling_fd_w)], any_order=True
+    )
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None

@@ -1,5 +1,6 @@
 import binascii
 import collections
+import contextlib
 import enum
 import operator
 import os
@@ -8,6 +9,8 @@ import select
 import socket
 import threading
 import time
+
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 try:
     import xxhash
@@ -27,13 +30,16 @@ class HashAlgorithm(enum.Enum):
 
 
 # How often to update a node's heartbeat.
-POLL_INTERVAL = 10
+POLL_INTERVAL_SECONDS = 10
 
 # After how much time a node is considered to be dead.
-NODE_TIMEOUT = 60
+NODE_TIMEOUT_SECONDS = 60
 
 # How often expired nodes are cleaned up from the ring.
-CLEANUP_INTERVAL = 120
+CLEANUP_INTERVAL_SECONDS = 120
+
+# How long a node waits for Redis to confirm its subscription to the ring.
+SUBSCRIBE_TIMEOUT_SECONDS = 10
 
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
@@ -140,6 +146,12 @@ class RingNode(object):
         self._polling_thread = None
         self._stop_polling_fd_r = None
         self._stop_polling_fd_w = None
+        # Set when the setup of the thread ends, with or without an error.
+        self._setup_done = threading.Event()
+        # The error that ended the setup, until `start` raises it.
+        self._setup_error = None
+        # Held by the `start` or `stop` call in progress, if any.
+        self._lifecycle_lock = threading.Lock()
 
         self._conn = conn
         self._key = key
@@ -190,7 +202,7 @@ class RingNode(object):
         The fetched ring only includes active nodes. Returns a list of tuples
         (start, replica) (see _fetch_all docs for more details).
         """
-        expiry_time = time.time() - NODE_TIMEOUT
+        expiry_time = time.time() - NODE_TIMEOUT_SECONDS
         data = self._conn.zrangebyscore(self._key, expiry_time, "INF")
 
         ring = []
@@ -210,7 +222,7 @@ class RingNode(object):
         * heartbeat: timestamp of the last heartbeat.
         * expired: boolean denoting whether this replica is inactive.
         """
-        expiry_time = time.time() - NODE_TIMEOUT
+        expiry_time = time.time() - NODE_TIMEOUT_SECONDS
         data = self._conn.zrange(self._key, 0, -1, withscores=True)
 
         ring = []
@@ -336,7 +348,7 @@ class RingNode(object):
         """
         Removes expired nodes from the ring.
         """
-        expired = time.time() - NODE_TIMEOUT
+        expired = time.time() - NODE_TIMEOUT_SECONDS
 
         if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
@@ -421,44 +433,81 @@ class RingNode(object):
                 return True
         return False
 
-    def poll(self):
+    def _poll(self):
         """
-        Keep a node in the hash ring.
+        Keep the node in the ring until the stop pipe receives data.
 
-        This should be kept running for as long as the node needs to stay in
-        the ring. This takes care of:
-        * Updating the heartbeat.
-        * Checking for ring updates.
-        * Cleaning up expired nodes periodically.
+        The loop does these tasks:
+        * Update the heartbeat.
+        * Update the ranges when the ring changes.
+        * Remove expired nodes from the ring periodically.
+
+        Set `self._setup_done` when the setup ends. If the setup fails,
+        store the error in `self._setup_error`. If the setup started to
+        write to the ring, try to remove the node from the ring. Then return.
         """
-        pubsub = self._conn.pubsub()
-        pubsub.subscribe(self._key)
-        pubsub_fd = pubsub.connection._sock.fileno()
+        pubsub = None
+        may_be_in_ring = False
+        try:
+            self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
 
-        last_heartbeat = time.time()
-        self.heartbeat()
+            # Keep subscribe messages, so that `get_message` returns the reply
+            # to the subscription.
+            pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
+            pubsub.subscribe(self._key)
+            # Wait for the reply to the subscription before `update`. After
+            # the reply, Redis sends each change of the ring to this
+            # connection, so no change after `update` gets lost. Wait with a
+            # limit of our own, so that the setup ends even if Redis does not
+            # reply.
+            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
+                raise RedisTimeoutError(
+                    f"No reply to the subscription to {self._key!r}"
+                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
+                )
+            pubsub_fd = pubsub.connection._sock.fileno()
 
-        last_cleanup = time.time()
-        self.cleanup()
+            last_heartbeat = time.time()
+            # From here on, the ring can hold replicas of this node, even if
+            # a call raises.
+            may_be_in_ring = True
+            self.heartbeat()
 
-        self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
+            self.update()
+
+            last_cleanup = time.time()
+            self.cleanup()
+        except BaseException as error:
+            self._setup_error = error
+            if pubsub is not None:
+                try:
+                    pubsub.close()
+                except Exception:
+                    # Keep the setup error, and go on to remove the node.
+                    pass
+            if may_be_in_ring:
+                try:
+                    # Undo the setup steps that worked before the error.
+                    self.remove()
+                except Exception:
+                    # Keep the setup error, not this one.
+                    pass
+            return
+        finally:
+            self._setup_done.set()
 
         try:
             while True:
                 # Since Redis' `listen` method blocks, we use `select` to
                 # inspect the underlying socket to see if there is activity.
                 timeout = max(
-                    0.0, POLL_INTERVAL - (time.time() - last_heartbeat)
+                    0.0, POLL_INTERVAL_SECONDS - (time.time() - last_heartbeat)
                 )
                 r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
                 )
 
                 if self._stop_polling_fd_r in r:
-                    os.close(self._stop_polling_fd_r)
-                    os.close(self._stop_polling_fd_w)
-                    self._stop_polling_fd_r = None
-                    self._stop_polling_fd_w = None
                     break
 
                 if pubsub_fd in r:
@@ -470,31 +519,104 @@ class RingNode(object):
                 self.heartbeat()
 
                 now = time.time()
-                if now - last_cleanup > CLEANUP_INTERVAL:
+                if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
                     last_cleanup = now
                     self.cleanup()
         finally:
             pubsub.close()
 
+    def _close_stop_pipe(self):
+        """
+        Close both ends of the stop pipe, if they are open.
+        """
+        if self._stop_polling_fd_r is not None:
+            os.close(self._stop_polling_fd_r)
+            self._stop_polling_fd_r = None
+        if self._stop_polling_fd_w is not None:
+            os.close(self._stop_polling_fd_w)
+            self._stop_polling_fd_w = None
+
+    @contextlib.contextmanager
+    def _hold_lifecycle_lock(self):
+        """
+        Hold the lifecycle lock during the block.
+
+        Raise `RuntimeError` if another `start` or `stop` call holds the lock.
+        Do not wait for the lock. If a signal handler calls `stop` during
+        `start` on the same thread, a wait never ends, because the thread
+        waits for itself.
+        """
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another `start` or `stop` call is in progress."
+            )
+        try:
+            yield
+        finally:
+            self._lifecycle_lock.release()
+
     def start(self):
         """
         Start the node.
+
+        Return when the node is in the ring and has its ranges. If the node
+        cannot join the ring, raise the error of the thread. Before that, try
+        to remove the replicas that the node added to the ring, if any.
+
+        Raise `RuntimeError` if the node already started, or if another
+        `start` or `stop` call on the node is in progress.
         """
-        self._polling_thread = threading.Thread(target=self.poll, daemon=True)
-        self._polling_thread.start()
+        with self._hold_lifecycle_lock():
+            if self._polling_thread is not None:
+                raise RuntimeError("The node already started.")
+
+            self._setup_done.clear()
+            self._setup_error = None
+            polling_thread = threading.Thread(
+                target=self._poll,
+                name=f"redis-hashring-{self._key}",
+                daemon=True,
+            )
+            polling_thread.start()
+            # Set the attribute only after the thread starts. If
+            # `Thread.start` raises, the node stays as if it never started.
+            self._polling_thread = polling_thread
+            self._setup_done.wait()
+            if self._setup_error is not None:
+                setup_error = self._setup_error
+                # Drop the reference. The traceback of the error refers to
+                # `self`.
+                self._setup_error = None
+                self._polling_thread.join()
+                self._polling_thread = None
+                self._close_stop_pipe()
+                raise setup_error
 
     def stop(self):
         """
-        Stop the node.
+        Stop the node, and remove it from the ring.
+
+        Raise `RuntimeError` if another `start` or `stop` call on the node is
+        in progress.
         """
-        if self._polling_thread:
-            while not self._stop_polling_fd_w:
-                # Let's give the thread some time to create the fd.
-                time.sleep(0.1)
-            os.write(self._stop_polling_fd_w, b"1")
-            self._polling_thread.join()
-            self._polling_thread = None
-        self.remove()
+        with self._hold_lifecycle_lock():
+            if self._polling_thread is not None:
+                # A `start` call that did not return, for example after a
+                # `KeyboardInterrupt`, can leave the setup in progress.
+                self._setup_done.wait()
+                if self._polling_thread.is_alive():
+                    os.write(self._stop_polling_fd_w, b"1")
+                self._polling_thread.join()
+                self._polling_thread = None
+                # If a `start` call did not return and its setup failed, the
+                # error stays in `self._setup_error`, because no call raised
+                # it. Clear the attribute. The traceback of the error holds
+                # the frames of the thread, and these frames refer to `self`.
+                # This reference cycle keeps the node in memory until the
+                # garbage collector runs.
+                self._setup_error = None
+                self._close_stop_pipe()
+            self.remove()
 
     def __enter__(self):
         self.start()
