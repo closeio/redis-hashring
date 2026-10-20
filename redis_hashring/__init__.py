@@ -176,8 +176,12 @@ class RingNode(object):
         # replace the whole state with one assignment, so a reader never sees
         # a partial state.
         self._state = _EMPTY_STATE
-        # Makes sure that `update` and `remove` run one at a time.
-        self._state_lock = threading.Lock()
+        # Makes sure that `update` and `remove` on different threads run one
+        # at a time. The lock is reentrant: a signal handler that interrupts
+        # `remove` can call `remove` again, and this lock does not block it.
+        self._state_lock = threading.RLock()
+        # Number of calls to `remove`. Changes only under `self._state_lock`.
+        self._removal_count = 0
 
     def _fetch_ring(self):
         """
@@ -304,14 +308,21 @@ class RingNode(object):
         # Hold the lock, so that an `update` that fetched the ring before the
         # ZREM cannot publish its ranges after the empty state.
         with self._state_lock:
+            self._removal_count += 1
             # Own no keys from now on, even if the ZREM fails.
             self._state = _EMPTY_STATE
 
-            pipeline = self._conn.pipeline()
+            try:
+                pipeline = self._conn.pipeline()
 
-            for replica in self._replicas:
-                pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
-            pipeline.execute()
+                for replica in self._replicas:
+                    pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
+                pipeline.execute()
+            finally:
+                # A signal handler on the main thread can call `update` during
+                # the ZREM, and publish the ranges of a ring that still has
+                # this node. Then clear the state again.
+                self._state = _EMPTY_STATE
 
         self._notify()
 
@@ -337,7 +348,17 @@ class RingNode(object):
         # Hold the lock during the fetch too. Otherwise, a call that fetched
         # an older ring can finish last, and the older ring wins.
         with self._state_lock:
-            self._state = self._compute_state(self._fetch_ring())
+            removal_count = self._removal_count
+            state = self._compute_state(self._fetch_ring())
+            # If this call runs on the main thread, a signal handler can call
+            # `remove` while this call holds the lock. Then the fetched ring
+            # can be older than the removal, so do not publish it.
+            if self._removal_count == removal_count:
+                self._state = state
+                # The signal handler can also run between the check and the
+                # assignment. Then clear the state again.
+                if self._removal_count != removal_count:
+                    self._state = _EMPTY_STATE
 
     def _compute_state(self, ring):
         """

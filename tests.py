@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from redis import Redis
+from redis.client import Pipeline
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from redis_hashring import RING_SIZE, HashAlgorithm, RingNode
@@ -108,6 +109,24 @@ def start_thread(target):
 def join_thread(thread):
     thread.join(timeout=5)
     assert not thread.is_alive()
+
+
+def lock_is_free(lock):
+    """
+    Return whether another thread can take the lock.
+
+    The owner of a reentrant lock can always take it again, so the check runs
+    on a new thread.
+    """
+    acquired = []
+
+    def try_acquire():
+        if lock.acquire(blocking=False):
+            acquired.append(True)
+            lock.release()
+
+    join_thread(start_thread(try_acquire))
+    return bool(acquired)
 
 
 class PausingRing(list):
@@ -234,7 +253,7 @@ def test_failed_update_keeps_old_state(redis):
 
     assert node.get_ranges() == ((0, RING_SIZE),)
     assert node.get_node_count() == 1
-    assert not node._state_lock.locked()
+    assert lock_is_free(node._state_lock)
 
 
 def test_remove_waits_for_update(redis):
@@ -264,12 +283,83 @@ def test_remove_clears_state_when_zrem_fails(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
     node.update()
 
-    with patch(
-        "redis.client.Pipeline.execute", side_effect=RedisConnectionError()
-    ):
+    with patch.object(Pipeline, "execute", side_effect=RedisConnectionError()):
         with pytest.raises(RedisConnectionError):
             node.remove()
 
     assert node.get_ranges() == ()
     assert node.get_node_count() == 0
-    assert not node._state_lock.locked()
+    assert lock_is_free(node._state_lock)
+
+
+def test_remove_during_remove_on_same_thread(redis):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    node.update()
+    execute = Pipeline.execute
+    nested_calls = []
+
+    def execute_with_nested_remove(pipeline):
+        # Call `remove` before the ZREM, on the same thread, like a signal
+        # handler that interrupts `remove`.
+        if not nested_calls:
+            nested_calls.append(True)
+            node.remove()
+        return execute(pipeline)
+
+    with patch.object(Pipeline, "execute", execute_with_nested_remove):
+        join_thread(start_thread(node.remove))
+
+    assert nested_calls
+    assert redis.zcard(TEST_KEY) == 0
+    assert node.get_ranges() == ()
+    assert node.get_node_count() == 0
+    assert lock_is_free(node._state_lock)
+
+
+def test_remove_clears_state_after_update_on_same_thread(redis):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    execute = Pipeline.execute
+    nested_ranges = []
+
+    def execute_with_nested_update(pipeline):
+        # Call `update` before the ZREM, on the same thread, like a signal
+        # handler that interrupts `remove`.
+        if not nested_ranges:
+            node.update()
+            nested_ranges.append(node.get_ranges())
+        return execute(pipeline)
+
+    with patch.object(Pipeline, "execute", execute_with_nested_update):
+        join_thread(start_thread(node.remove))
+
+    # The ring still had the node, so the nested `update` published ranges.
+    assert nested_ranges == [((0, RING_SIZE),)]
+    assert redis.zcard(TEST_KEY) == 0
+    assert node.get_ranges() == ()
+    assert node.get_node_count() == 0
+    assert lock_is_free(node._state_lock)
+
+
+def test_update_keeps_empty_state_after_remove_on_same_thread(redis):
+    node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
+    own_replica = node._replicas[0][1]
+
+    def fetch_ring_with_nested_remove():
+        # Call `remove` during the fetch, on the same thread, like a signal
+        # handler that interrupts `update`.
+        node.remove()
+        return [(0, own_replica)]
+
+    node._fetch_ring = fetch_ring_with_nested_remove
+    join_thread(start_thread(node.update))
+
+    assert redis.zcard(TEST_KEY) == 0
+    assert node.get_ranges() == ()
+    assert node.get_node_count() == 0
+    assert lock_is_free(node._state_lock)
+
+    # The next update publishes its ranges.
+    node._fetch_ring = Mock(return_value=[(0, own_replica)])
+    node.update()
+    assert node.get_ranges() == ((0, RING_SIZE),)
+    assert node.get_node_count() == 1
