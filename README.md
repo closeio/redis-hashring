@@ -243,6 +243,11 @@ the following:
   If the node already started, `start()` raises `RuntimeError`. After
   `stop()`, or after a `start()` call that raises, the node can start again.
 
+  Only one `start()` or `stop()` call on a node can run at a time. If another
+  call on the same node is in progress, both methods raise `RuntimeError`.
+  They do not wait for the other call. Thus, a signal handler that calls
+  `stop()` during `start()` on the same thread gets an error, not a deadlock.
+
   `start()` waits up to 10 seconds for Redis to confirm the subscription to
   the channel of the ring. If no reply arrives, `start()` raises
   `redis.exceptions.TimeoutError`.

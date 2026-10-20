@@ -433,6 +433,80 @@ def test_start_twice_raises(redis):
         assert node._polling_thread.is_alive()
 
 
+def test_start_and_stop_raise_during_start_on_other_thread(redis):
+    node = RingNode(redis, TEST_KEY)
+    original_heartbeat = node.heartbeat
+    setup_paused = threading.Event()
+    resume_setup = threading.Event()
+
+    def heartbeat():
+        setup_paused.set()
+        resume_setup.wait()
+        original_heartbeat()
+
+    try:
+        with patch.object(node, "heartbeat", side_effect=heartbeat):
+            first_start_thread = start_thread(node.start)
+            try:
+                assert setup_paused.wait(timeout=5)
+                with pytest.raises(RuntimeError, match="in progress"):
+                    node.stop()
+                with pytest.raises(RuntimeError, match="in progress"):
+                    node.start()
+            finally:
+                # Let the first call end, even if an assertion fails.
+                resume_setup.set()
+                join_thread(first_start_thread)
+
+        # The first call joined the ring.
+        assert node._polling_thread.is_alive()
+        assert node.get_node_count() == 1
+    finally:
+        # Stop the node, so that it does not change the ring in the next
+        # tests.
+        node.stop()
+
+    assert redis.zcard(TEST_KEY) == 0
+
+
+def test_stop_during_start_on_same_thread_raises(redis):
+    node = RingNode(redis, TEST_KEY)
+    original_wait = node._setup_done.wait
+    nested_errors = []
+
+    def wait_with_nested_stop(*args, **kwargs):
+        # Call `stop` once during `start`, on the same thread, like a signal
+        # handler that interrupts `start`.
+        if not nested_errors:
+            try:
+                node.stop()
+            except RuntimeError as error:
+                nested_errors.append(error)
+            else:
+                nested_errors.append(None)
+        return original_wait(*args, **kwargs)
+
+    try:
+        with patch.object(
+            node._setup_done, "wait", side_effect=wait_with_nested_stop
+        ):
+            # Run `start` on a new thread, so that a deadlock fails the test.
+            join_thread(start_thread(node.start))
+
+        assert len(nested_errors) == 1
+        assert isinstance(nested_errors[0], RuntimeError)
+        assert "in progress" in str(nested_errors[0])
+        # The outer call joined the ring.
+        assert node._polling_thread.is_alive()
+        assert node.get_node_count() == 1
+    finally:
+        # Stop the node, so that it does not change the ring in the next
+        # tests.
+        node.stop()
+
+    assert redis.zcard(TEST_KEY) == 0
+
+
 def test_start_after_stop(redis):
     node = RingNode(redis, TEST_KEY)
     with node:

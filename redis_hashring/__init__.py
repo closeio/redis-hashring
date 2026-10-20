@@ -1,5 +1,6 @@
 import binascii
 import collections
+import contextlib
 import enum
 import operator
 import os
@@ -149,6 +150,8 @@ class RingNode(object):
         self._setup_done = threading.Event()
         # The error that ended the setup, until `start` raises it.
         self._setup_error = None
+        # Held by the `start` or `stop` call in progress, if any.
+        self._lifecycle_lock = threading.Lock()
 
         self._conn = conn
         self._key = key
@@ -533,6 +536,25 @@ class RingNode(object):
             os.close(self._stop_polling_fd_w)
             self._stop_polling_fd_w = None
 
+    @contextlib.contextmanager
+    def _hold_lifecycle_lock(self):
+        """
+        Hold the lifecycle lock during the block.
+
+        Raise `RuntimeError` if another `start` or `stop` call holds the lock.
+        Do not wait for the lock. If a signal handler calls `stop` during
+        `start` on the same thread, a wait never ends, because the thread
+        waits for itself.
+        """
+        if not self._lifecycle_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another `start` or `stop` call is in progress."
+            )
+        try:
+            yield
+        finally:
+            self._lifecycle_lock.release()
+
     def start(self):
         """
         Start the node.
@@ -541,51 +563,56 @@ class RingNode(object):
         cannot join the ring, raise the error of the thread. Before that, try
         to remove the replicas that the node added to the ring, if any.
 
-        Raise `RuntimeError` if the node already started.
-
-        Do not call `start` or `stop` from two threads at the same time.
+        Raise `RuntimeError` if the node already started, or if another
+        `start` or `stop` call on the node is in progress.
         """
-        if self._polling_thread is not None:
-            raise RuntimeError("The node already started.")
+        with self._hold_lifecycle_lock():
+            if self._polling_thread is not None:
+                raise RuntimeError("The node already started.")
 
-        self._setup_done.clear()
-        self._setup_error = None
-        polling_thread = threading.Thread(
-            target=self._poll, name=f"redis-hashring-{self._key}", daemon=True
-        )
-        polling_thread.start()
-        # Set the attribute only after the thread starts. If `Thread.start`
-        # raises, the node stays as if it never started.
-        self._polling_thread = polling_thread
-        self._setup_done.wait()
-        if self._setup_error is not None:
-            setup_error = self._setup_error
-            # Drop the reference. The traceback of the error refers to `self`.
+            self._setup_done.clear()
             self._setup_error = None
-            self._polling_thread.join()
-            self._polling_thread = None
-            self._close_stop_pipe()
-            raise setup_error
+            polling_thread = threading.Thread(
+                target=self._poll,
+                name=f"redis-hashring-{self._key}",
+                daemon=True,
+            )
+            polling_thread.start()
+            # Set the attribute only after the thread starts. If
+            # `Thread.start` raises, the node stays as if it never started.
+            self._polling_thread = polling_thread
+            self._setup_done.wait()
+            if self._setup_error is not None:
+                setup_error = self._setup_error
+                # Drop the reference. The traceback of the error refers to
+                # `self`.
+                self._setup_error = None
+                self._polling_thread.join()
+                self._polling_thread = None
+                self._close_stop_pipe()
+                raise setup_error
 
     def stop(self):
         """
         Stop the node, and remove it from the ring.
 
-        Do not call `start` or `stop` from two threads at the same time.
+        Raise `RuntimeError` if another `start` or `stop` call on the node is
+        in progress.
         """
-        if self._polling_thread is not None:
-            # A `start` call that did not return, for example after a
-            # `KeyboardInterrupt`, can leave the setup in progress.
-            self._setup_done.wait()
-            if self._polling_thread.is_alive():
-                os.write(self._stop_polling_fd_w, b"1")
-            self._polling_thread.join()
-            self._polling_thread = None
-            # The setup can fail after such a `start` call. Drop the error.
-            # Its traceback refers to `self`.
-            self._setup_error = None
-            self._close_stop_pipe()
-        self.remove()
+        with self._hold_lifecycle_lock():
+            if self._polling_thread is not None:
+                # A `start` call that did not return, for example after a
+                # `KeyboardInterrupt`, can leave the setup in progress.
+                self._setup_done.wait()
+                if self._polling_thread.is_alive():
+                    os.write(self._stop_polling_fd_w, b"1")
+                self._polling_thread.join()
+                self._polling_thread = None
+                # The setup can fail after such a `start` call. Drop the
+                # error. Its traceback refers to `self`.
+                self._setup_error = None
+                self._close_stop_pipe()
+            self.remove()
 
     def __enter__(self):
         self.start()
