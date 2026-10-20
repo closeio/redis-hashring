@@ -235,13 +235,32 @@ the following:
   `RingNode.start()` returns when the node is in the ring and has its ranges.
   Thus, `contains()` gives correct results right after `start()`.
 
-  If the node cannot join the ring, `start()` raises the error. For example,
+  If the node cannot join the ring, `start()` raises an error. For example,
   this happens when Redis is not available. Before it raises, `start()` tries
-  to remove the replicas that the node added to the ring, if any. If the
-  removal also fails, the other nodes ignore these replicas after 60 seconds.
+  to remove the replicas that the node added to the ring, if any.
+
+  If the removal also fails, the replicas stay in the ring. The other nodes
+  can count these replicas, and then no node owns the ranges of the replicas.
+  A replica expires 60 seconds after its last heartbeat, but the other nodes
+  see the expiry only when they read the ring. Each active node reads the
+  ring after each heartbeat, every 10 seconds. Thus, the ranges can stay
+  without an owner for up to about 70 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
-  `stop()`, or after a `start()` call that raises, the node can start again.
+  `stop()`, or after a `start()` call that cannot join the ring, the node can
+  start again.
+
+  Only one `start()` or `stop()` call on a node can run at a time. If another
+  call on the same node is in progress, both methods raise `RuntimeError`.
+  They do not wait for the other call. Thus, a signal handler that calls
+  `stop()` during `start()` on the same thread gets an error, not a deadlock.
+
+  If something interrupts `start()`, the thread continues and can join the
+  ring. Examples are `KeyboardInterrupt` and the error of a `stop()` call from
+  a signal handler. Until a call to `stop()`, the node can stay in the ring,
+  and `start()` raises `RuntimeError`. The `with` statement does not call
+  `stop()` in this case, because Python calls `__exit__` only after
+  `__enter__` returns.
 
   `start()` waits up to 10 seconds for Redis to confirm the subscription to
   the channel of the ring. If no reply arrives, `start()` raises
