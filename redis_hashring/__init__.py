@@ -2,11 +2,12 @@ import binascii
 import collections
 import contextlib
 import enum
+import math
 import operator
 import os
 import random
-import select
 import socket
+import sys
 import threading
 import time
 
@@ -41,6 +42,16 @@ CLEANUP_INTERVAL_SECONDS = 120
 # How long a node waits for Redis to confirm its subscription to the ring.
 SUBSCRIBE_TIMEOUT_SECONDS = 10
 
+# How often the thread checks whether `stop` asked it to exit.
+STOP_CHECK_INTERVAL_SECONDS = 1
+
+# The retry interval after the first error.
+RETRY_INTERVAL_MIN_SECONDS = 1
+
+# The longest retry interval. It equals `POLL_INTERVAL_SECONDS`, so that a
+# retry waits no longer than the interval between two heartbeats.
+RETRY_INTERVAL_MAX_SECONDS = POLL_INTERVAL_SECONDS
+
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
 #   includes any N matching a <= N < b.
@@ -64,6 +75,42 @@ def _decode(data):
         return data.decode()
     else:
         return data
+
+
+def _close_pubsub(pubsub):
+    """
+    Close the pub/sub object, if any, and ignore errors from the close.
+    """
+    if pubsub is not None:
+        try:
+            pubsub.close()
+        except Exception:
+            pass
+
+
+def _report_error():
+    """
+    Pass the error that the current thread handles to `threading.excepthook`.
+    """
+    try:
+        threading.excepthook(
+            threading.ExceptHookArgs(
+                [*sys.exc_info(), threading.current_thread()]
+            )
+        )
+    except Exception:
+        # An error in the hook must not end the thread.
+        pass
+
+
+def _deadline_after(last_heartbeat):
+    """
+    Return the time `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds
+    after `last_heartbeat`.
+
+    `last_heartbeat` and the result are `time.monotonic` values.
+    """
+    return last_heartbeat + NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS
 
 
 class RingNode(object):
@@ -144,8 +191,8 @@ class RingNode(object):
                 for xxHash, use `HashAlgorithm.CRC32`.
         """
         self._polling_thread = None
-        self._stop_polling_fd_r = None
-        self._stop_polling_fd_w = None
+        # Set when `stop` asks the thread to exit.
+        self._stop_requested = threading.Event()
         # Set when the setup of the thread ends, with or without an error.
         self._setup_done = threading.Event()
         # The error that ended the setup, until `start` raises it.
@@ -184,9 +231,9 @@ class RingNode(object):
             for _ in range(n_replicas)
         ]
 
-        # Readers take no lock, and read `self._state` once per call. Writers
-        # replace the whole state with one assignment, so a reader never sees
-        # a partial state.
+        # Readers take no lock, and read the state once per call, through
+        # `_read_state`. Writers replace the whole state with one assignment,
+        # so a reader never sees a partial state.
         self._state = _EMPTY_STATE
         # Makes sure that `update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
@@ -194,6 +241,10 @@ class RingNode(object):
         self._state_lock = threading.RLock()
         # Number of calls to `remove`. Changes only under `self._state_lock`.
         self._removal_count = 0
+        # The deadline: the `time.monotonic` value after which readers see an
+        # empty state. Readers compare it with the time at each call, so no
+        # Redis call can delay the deadline.
+        self._deadline = math.inf
 
     def _fetch_ring(self):
         """
@@ -344,6 +395,34 @@ class RingNode(object):
         """
         self._conn.publish(self._key, "*")
 
+    def _subscribe(self):
+        """
+        Return a new pub/sub object, subscribed to the ring's activity channel.
+
+        Return after Redis confirms the subscription. After that, Redis sends
+        each notice on the channel to the pub/sub object. If no confirmation
+        arrives in `SUBSCRIBE_TIMEOUT_SECONDS` seconds, raise
+        `redis.exceptions.TimeoutError`.
+
+        If a step fails, close the pub/sub object before the error goes up.
+        """
+        # Keep subscribe messages, so that `get_message` returns the reply to
+        # the subscription.
+        pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
+        try:
+            pubsub.subscribe(self._key)
+            # Wait with a limit of our own, so that the call ends even if
+            # Redis does not reply.
+            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
+                raise RedisTimeoutError(
+                    f"No reply to the subscription to {self._key!r}"
+                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
+                )
+        except BaseException:
+            _close_pubsub(pubsub)
+            raise
+        return pubsub
+
     def cleanup(self):
         """
         Removes expired nodes from the ring.
@@ -399,24 +478,51 @@ class RingNode(object):
 
         return _RingState(ranges=tuple(ranges), node_count=len(nodes))
 
+    def _clear_state(self):
+        """
+        Make sure that this node owns no keys.
+        """
+        with self._state_lock:
+            self._state = _EMPTY_STATE
+
+    def _read_state(self):
+        """
+        Return `self._state`, or an empty state after `self._deadline`.
+        """
+        if time.monotonic() >= self._deadline:
+            return _EMPTY_STATE
+        return self._state
+
     def get_ranges(self):
         """
         Return a tuple of the hash ring ranges that this node owns.
 
         Each range is a tuple (a, b) that includes any ring point N with
         a <= N < b.
+
+        While the node runs, return an empty tuple after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
-        return self._state.ranges
+        return self._read_state().ranges
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
+
+        While the node runs, return 0 after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
-        return self._state.node_count
+        return self._read_state().node_count
 
     def contains(self, key):
         """
         Check whether this node is responsible for the item.
+
+        While the node runs, return `False` after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
         return self._contains_ring_point(self.key_as_ring_point(key))
 
@@ -428,63 +534,59 @@ class RingNode(object):
         """
         Check whether this node is responsible for the ring point.
         """
-        for start, end in self._state.ranges:
+        for start, end in self._read_state().ranges:
             if start <= n < end:
                 return True
         return False
 
+    def _wait_before_retry(self, retry_interval):
+        """
+        Wait before the next attempt after an error.
+
+        Wait for a random time between half `retry_interval` and the full
+        interval, so that the nodes do not all try again at the same time.
+        Return early if `self._stop_requested` is set.
+        """
+        self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
+
     def _poll(self):
         """
-        Keep the node in the ring until the stop pipe receives data.
+        Keep the node in the ring until `stop` asks the thread to exit.
 
-        The loop does these tasks:
-        * Update the heartbeat.
-        * Update the ranges when the ring changes.
-        * Remove expired nodes from the ring periodically.
+        First, run the setup: subscribe to the ring's activity channel, and
+        run `heartbeat`, `update`, and `cleanup`. Set `self._setup_done` when
+        the setup ends. If the setup fails, store the error in
+        `self._setup_error`. If the setup started to write to the ring, try
+        to remove the node from the ring. Then return.
 
-        Set `self._setup_done` when the setup ends. If the setup fails,
-        store the error in `self._setup_error`. If the setup started to
-        write to the ring, try to remove the node from the ring. Then return.
+        After the setup, run `_run_loop`.
         """
         pubsub = None
         may_be_in_ring = False
         try:
-            self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
+            # Subscribe before `update`, so that no change of the ring after
+            # `update` gets lost.
+            pubsub = self._subscribe()
 
-            # Keep subscribe messages, so that `get_message` returns the reply
-            # to the subscription.
-            pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
-            pubsub.subscribe(self._key)
-            # Wait for the reply to the subscription before `update`. After
-            # the reply, Redis sends each change of the ring to this
-            # connection, so no change after `update` gets lost. Wait with a
-            # limit of our own, so that the setup ends even if Redis does not
-            # reply.
-            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
-                raise RedisTimeoutError(
-                    f"No reply to the subscription to {self._key!r}"
-                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
-                )
-            pubsub_fd = pubsub.connection._sock.fileno()
-
-            last_heartbeat = time.time()
             # From here on, the ring can hold replicas of this node, even if
             # a call raises.
             may_be_in_ring = True
+            # Take the time before each heartbeat, not after it. Thus, a slow
+            # heartbeat does not delay the deadline.
+            last_heartbeat = time.monotonic()
             self.heartbeat()
 
             self.update()
 
-            last_cleanup = time.time()
             self.cleanup()
+            last_cleanup = time.monotonic()
+
+            # The setup worked. From now on, readers see the state only until
+            # the deadline of the last heartbeat.
+            self._deadline = _deadline_after(last_heartbeat)
         except BaseException as error:
             self._setup_error = error
-            if pubsub is not None:
-                try:
-                    pubsub.close()
-                except Exception:
-                    # Keep the setup error, and go on to remove the node.
-                    pass
+            _close_pubsub(pubsub)
             if may_be_in_ring:
                 try:
                     # Undo the setup steps that worked before the error.
@@ -496,45 +598,119 @@ class RingNode(object):
         finally:
             self._setup_done.set()
 
+        self._run_loop(pubsub, last_heartbeat, last_cleanup)
+
+    def _run_loop(self, pubsub, last_heartbeat, last_cleanup):
+        """
+        Keep the node in the ring until `stop` asks the thread to exit.
+
+        The loop does these tasks:
+        * Update the heartbeat.
+        * Update the ranges when the ring changes, and after each heartbeat.
+        * Remove expired nodes from the ring periodically.
+        * After each heartbeat and the update after it, set the deadline to
+          `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds after the
+          start of the heartbeat. If a heartbeat ends after the deadline of
+          the previous heartbeat, notify the other nodes.
+
+        Report each error, and try again, until `stop` asks the thread to
+        exit. Then close the pub/sub object, clear the state, and remove the
+        deadline.
+
+        Args:
+            pubsub: A pub/sub object, subscribed to the ring's activity
+                channel.
+            last_heartbeat: The `time.monotonic` value at the start of the
+                last heartbeat.
+            last_cleanup: The `time.monotonic` value at the end of the last
+                cleanup.
+        """
+        retry_interval = RETRY_INTERVAL_MIN_SECONDS
         try:
-            while True:
-                # Since Redis' `listen` method blocks, we use `select` to
-                # inspect the underlying socket to see if there is activity.
-                timeout = max(
-                    0.0, POLL_INTERVAL_SECONDS - (time.time() - last_heartbeat)
-                )
-                r, _, _ = select.select(
-                    [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
-                )
+            while not self._stop_requested.is_set():
+                try:
+                    resubscribed = pubsub is None
+                    if resubscribed:
+                        pubsub = self._subscribe()
+                        # If `stop` asked the thread to exit during the
+                        # subscription, exit before more Redis calls.
+                        if self._stop_requested.is_set():
+                            break
 
-                if self._stop_polling_fd_r in r:
-                    break
+                    now = time.monotonic()
+                    if (
+                        resubscribed
+                        or now - last_heartbeat >= POLL_INTERVAL_SECONDS
+                    ):
+                        heartbeat_started = now
+                        previous_deadline = _deadline_after(last_heartbeat)
+                        self.heartbeat()
+                        # If `stop` asked the thread to exit during the
+                        # heartbeat, exit before more Redis calls. The node
+                        # leaves the ring, so the notice and the update are
+                        # not necessary.
+                        if self._stop_requested.is_set():
+                            break
+                        if time.monotonic() >= previous_deadline:
+                            # The heartbeat ended after the deadline, so the
+                            # other nodes can see the replicas of this node
+                            # as expired. Make them read the ring again, so
+                            # that they give back the keys of this node. If
+                            # the notice fails, `last_heartbeat` keeps its
+                            # value, and the next attempt sends it again.
+                            self._notify()
+                        last_heartbeat = heartbeat_started
+                        # Read the ring after each heartbeat. Thus, the node
+                        # sees the changes of the ring that it missed. A new
+                        # subscription, or a pub/sub connection that died
+                        # without an error, can miss changes.
+                        self.update()
+                        # Move the deadline after `update`, not after the
+                        # heartbeat. Thus, if `update` fails after the
+                        # deadline, readers do not see the old ranges again.
+                        self._deadline = _deadline_after(last_heartbeat)
 
-                if pubsub_fd in r:
-                    while pubsub.get_message():
-                        pass
-                    self.update()
+                    # If `stop` asked the thread to exit during the update,
+                    # exit before the wait for a notice.
+                    if self._stop_requested.is_set():
+                        break
 
-                last_heartbeat = time.time()
-                self.heartbeat()
+                    # Wait for a notice until the next heartbeat is due. Wake
+                    # up every `STOP_CHECK_INTERVAL_SECONDS` seconds to check
+                    # for a request to stop.
+                    next_heartbeat_at = last_heartbeat + POLL_INTERVAL_SECONDS
+                    timeout = min(
+                        STOP_CHECK_INTERVAL_SECONDS,
+                        max(0.0, next_heartbeat_at - time.monotonic()),
+                    )
+                    if pubsub.get_message(timeout=timeout) is not None:
+                        while pubsub.get_message() is not None:
+                            pass
+                        self.update()
 
-                now = time.time()
-                if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
-                    last_cleanup = now
-                    self.cleanup()
+                    if (
+                        time.monotonic() - last_cleanup
+                        >= CLEANUP_INTERVAL_SECONDS
+                    ):
+                        self.cleanup()
+                        last_cleanup = time.monotonic()
+
+                    retry_interval = RETRY_INTERVAL_MIN_SECONDS
+                except Exception:
+                    _report_error()
+                    _close_pubsub(pubsub)
+                    pubsub = None
+                    self._wait_before_retry(retry_interval)
+                    retry_interval = min(
+                        retry_interval * 2, RETRY_INTERVAL_MAX_SECONDS
+                    )
         finally:
-            pubsub.close()
-
-    def _close_stop_pipe(self):
-        """
-        Close both ends of the stop pipe, if they are open.
-        """
-        if self._stop_polling_fd_r is not None:
-            os.close(self._stop_polling_fd_r)
-            self._stop_polling_fd_r = None
-        if self._stop_polling_fd_w is not None:
-            os.close(self._stop_polling_fd_w)
-            self._stop_polling_fd_w = None
+            _close_pubsub(pubsub)
+            # No heartbeat keeps the node in the ring from now on. Clear the
+            # state before the deadline goes away, so that readers do not see
+            # old ranges.
+            self._clear_state()
+            self._deadline = math.inf
 
     @contextlib.contextmanager
     def _hold_lifecycle_lock(self):
@@ -572,6 +748,7 @@ class RingNode(object):
 
             self._setup_done.clear()
             self._setup_error = None
+            self._stop_requested.clear()
             polling_thread = threading.Thread(
                 target=self._poll,
                 name=f"redis-hashring-{self._key}",
@@ -589,23 +766,21 @@ class RingNode(object):
                 self._setup_error = None
                 self._polling_thread.join()
                 self._polling_thread = None
-                self._close_stop_pipe()
                 raise setup_error
 
     def stop(self):
         """
         Stop the node, and remove it from the ring.
 
+        This takes up to `STOP_CHECK_INTERVAL_SECONDS` seconds, plus the time
+        of the Redis calls in progress.
+
         Raise `RuntimeError` if another `start` or `stop` call on the node is
         in progress.
         """
         with self._hold_lifecycle_lock():
             if self._polling_thread is not None:
-                # A `start` call that did not return, for example after a
-                # `KeyboardInterrupt`, can leave the setup in progress.
-                self._setup_done.wait()
-                if self._polling_thread.is_alive():
-                    os.write(self._stop_polling_fd_w, b"1")
+                self._stop_requested.set()
                 self._polling_thread.join()
                 self._polling_thread = None
                 # If a `start` call did not return and its setup failed, the
@@ -615,7 +790,6 @@ class RingNode(object):
                 # This reference cycle keeps the node in memory until the
                 # garbage collector runs.
                 self._setup_error = None
-                self._close_stop_pipe()
             self.remove()
 
     def __enter__(self):

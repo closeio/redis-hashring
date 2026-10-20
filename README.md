@@ -242,10 +242,9 @@ the following:
   If the removal also fails, the replicas stay in the ring. The other nodes
   can count these replicas, and then no node owns the ranges of the replicas.
   A replica expires 60 seconds after its last heartbeat, but the other nodes
-  see the expiry only when the ring changes. If nothing else changes, the
-  change comes when an active node removes the expired replicas. Each active
-  node does this every 120 to 130 seconds. Thus, the ranges can stay without
-  an owner for up to about 190 seconds after the last heartbeat.
+  see the expiry only when they read the ring. Each active node reads the
+  ring after each heartbeat, every 10 seconds. Thus, the ranges can stay
+  without an owner for up to about 70 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
   `stop()`, or after a `start()` call that cannot join the ring, the node can
@@ -267,8 +266,46 @@ the following:
   the channel of the ring. If no reply arrives, `start()` raises
   `redis.exceptions.TimeoutError`.
 
+  The thread checks for a request to stop at least once per second. Thus,
+  `stop()` takes up to 1 second, plus the time of the Redis calls that the
+  thread runs before the check. After a Redis error, these calls include a new
+  subscription, which can wait up to 10 seconds for its confirmation.
+
   For the other Redis calls, `start()` and `stop()` have no timeout of their
   own. `start()` waits for the node to join the ring. `stop()` waits for the
-  Redis call that the thread runs, if any. The socket timeouts of the Redis
+  Redis calls that the thread runs, if any. The socket timeouts of the Redis
   client limit these waits. Without socket timeouts, both methods can wait
   forever if Redis does not respond.
+
+- Redis errors
+
+  After `start()` returns, the node tries again after each error, until
+  `stop()`. Before each new attempt, the node waits for a random time. The
+  longest wait is 1 second after the first error. It doubles after each
+  failed attempt, up to 10 seconds.
+
+  The node passes each error to `threading.excepthook`. By default, Python
+  prints the traceback of the error to stderr. To handle the errors in another
+  way, set `threading.excepthook` in the application.
+
+  The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
+  node misses a notice of a change of the ring, it sees the change within 10
+  seconds.
+
+  If the node cannot send a heartbeat and then read the ring for 50 seconds,
+  it gives up its keys. Then `contains()` returns `False` for all keys,
+  `get_ranges()` returns an empty tuple, and `get_node_count()` returns 0.
+  The other nodes see the node as dead after 60 seconds, so the node gives up
+  its keys first. Each heartbeat stores the time on the clock of the node, and
+  the other nodes compare it with their own clocks. Thus, the node gives up its
+  keys first only if the clocks of the hosts differ by less than 10 seconds. If
+  the clocks differ by more, two nodes can own the same keys at the same time.
+
+  These three methods compare the current time with the 50-second deadline
+  at each call. Thus, the node gives up its keys on time, even if a Redis call
+  of the thread blocks.
+
+  When Redis is available again, the node joins the ring again and gets its
+  keys back. If the node had no successful heartbeat for 50 seconds, it
+  notifies the other nodes after the next heartbeat. Then they read the ring
+  and give the keys back.
