@@ -237,8 +237,15 @@ the following:
 
   If the node cannot join the ring, `start()` raises an error. For example,
   this happens when Redis is not available. Before it raises, `start()` tries
-  to remove the replicas that the node added to the ring, if any. If the
-  removal also fails, the other nodes ignore these replicas after 60 seconds.
+  to remove the replicas that the node added to the ring, if any.
+
+  If the removal also fails, the replicas stay in the ring. The other nodes
+  can count these replicas, and then no node owns the ranges of the replicas.
+  A replica expires 60 seconds after its last heartbeat, but the other nodes
+  see the expiry only when the ring changes. If nothing else changes, the
+  change comes when an active node removes the expired replicas. Each active
+  node does this every 120 to 130 seconds. Thus, the ranges can stay without
+  an owner for up to about 190 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
   `stop()`, or after a `start()` call that raises, the node can start again.
