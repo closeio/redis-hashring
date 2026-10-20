@@ -608,8 +608,12 @@ class RingNode(object):
                     os.write(self._stop_polling_fd_w, b"1")
                 self._polling_thread.join()
                 self._polling_thread = None
-                # The setup can fail after such a `start` call. Drop the
-                # error. Its traceback refers to `self`.
+                # If a `start` call did not return and its setup failed, the
+                # error stays in `self._setup_error`, because no call raised
+                # it. Clear the attribute. The traceback of the error holds
+                # the frames of the thread, and these frames refer to `self`.
+                # This reference cycle keeps the node in memory until the
+                # garbage collector runs.
                 self._setup_error = None
                 self._close_stop_pipe()
             self.remove()
