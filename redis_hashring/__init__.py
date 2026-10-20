@@ -29,16 +29,16 @@ class HashAlgorithm(enum.Enum):
 
 
 # How often to update a node's heartbeat.
-POLL_INTERVAL = 10
+POLL_INTERVAL_SECONDS = 10
 
 # After how much time a node is considered to be dead.
-NODE_TIMEOUT = 60
+NODE_TIMEOUT_SECONDS = 60
 
 # How often expired nodes are cleaned up from the ring.
-CLEANUP_INTERVAL = 120
+CLEANUP_INTERVAL_SECONDS = 120
 
 # How long a node waits for Redis to confirm its subscription to the ring.
-SUBSCRIBE_TIMEOUT = 10
+SUBSCRIBE_TIMEOUT_SECONDS = 10
 
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
@@ -199,7 +199,7 @@ class RingNode(object):
         The fetched ring only includes active nodes. Returns a list of tuples
         (start, replica) (see _fetch_all docs for more details).
         """
-        expiry_time = time.time() - NODE_TIMEOUT
+        expiry_time = time.time() - NODE_TIMEOUT_SECONDS
         data = self._conn.zrangebyscore(self._key, expiry_time, "INF")
 
         ring = []
@@ -219,7 +219,7 @@ class RingNode(object):
         * heartbeat: timestamp of the last heartbeat.
         * expired: boolean denoting whether this replica is inactive.
         """
-        expiry_time = time.time() - NODE_TIMEOUT
+        expiry_time = time.time() - NODE_TIMEOUT_SECONDS
         data = self._conn.zrange(self._key, 0, -1, withscores=True)
 
         ring = []
@@ -345,7 +345,7 @@ class RingNode(object):
         """
         Removes expired nodes from the ring.
         """
-        expired = time.time() - NODE_TIMEOUT
+        expired = time.time() - NODE_TIMEOUT_SECONDS
 
         if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
@@ -457,10 +457,10 @@ class RingNode(object):
             # connection, so no change after `update` gets lost. Wait with a
             # limit of our own, so that the setup ends even if Redis does not
             # reply.
-            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT) is None:
+            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
                 raise RedisTimeoutError(
                     f"No reply to the subscription to {self._key!r}"
-                    f" after {SUBSCRIBE_TIMEOUT} s."
+                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
                 )
             pubsub_fd = pubsub.connection._sock.fileno()
 
@@ -498,7 +498,7 @@ class RingNode(object):
                 # Since Redis' `listen` method blocks, we use `select` to
                 # inspect the underlying socket to see if there is activity.
                 timeout = max(
-                    0.0, POLL_INTERVAL - (time.time() - last_heartbeat)
+                    0.0, POLL_INTERVAL_SECONDS - (time.time() - last_heartbeat)
                 )
                 r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
@@ -516,7 +516,7 @@ class RingNode(object):
                 self.heartbeat()
 
                 now = time.time()
-                if now - last_cleanup > CLEANUP_INTERVAL:
+                if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
                     last_cleanup = now
                     self.cleanup()
         finally:

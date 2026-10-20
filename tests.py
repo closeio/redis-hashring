@@ -14,7 +14,7 @@ from redis.exceptions import (
 
 from redis_hashring import (
     RING_SIZE,
-    SUBSCRIBE_TIMEOUT,
+    SUBSCRIBE_TIMEOUT_SECONDS,
     HashAlgorithm,
     RingNode,
 )
@@ -418,7 +418,7 @@ def test_start_raises_when_subscription_gets_no_reply(redis):
             node.start()
 
     # The setup waits for the reply with a limit.
-    get_message.assert_called_once_with(timeout=SUBSCRIBE_TIMEOUT)
+    get_message.assert_called_once_with(timeout=SUBSCRIBE_TIMEOUT_SECONDS)
     assert set(threading.enumerate()) <= threads_before
     assert node._polling_thread is None
     # The setup failed before it wrote to the ring.
