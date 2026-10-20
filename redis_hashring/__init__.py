@@ -35,6 +35,14 @@ NODE_TIMEOUT = 60
 # How often expired nodes are cleaned up from the ring.
 CLEANUP_INTERVAL = 120
 
+# The state of a node:
+# * ranges: tuple of the ranges that the node owns, where a range (a, b)
+#   includes any N matching a <= N < b.
+# * node_count: number of nodes currently active in the ring.
+_RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
+
+_EMPTY_STATE = _RingState(ranges=(), node_count=0)
+
 
 def _hash_with_xxhash(key):
     return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
@@ -164,11 +172,16 @@ class RingNode(object):
             for _ in range(n_replicas)
         ]
 
-        # Number of nodes currently active in the ring.
-        self._node_count = 0
-        # List of tuples of ranges this node is responsible for, where a tuple
-        # (a, b) includes any N matching a <= N < b.
-        self._ranges = []
+        # Readers take no lock, and read `self._state` once per call. Writers
+        # replace the whole state with one assignment, so a reader never sees
+        # a partial state.
+        self._state = _EMPTY_STATE
+        # Makes sure that `update` and `remove` on different threads run one
+        # at a time. The lock is reentrant: a signal handler that interrupts
+        # `remove` can call `remove` again, and this lock does not block it.
+        self._state_lock = threading.RLock()
+        # Number of calls to `remove`. Changes only under `self._state_lock`.
+        self._removal_count = 0
 
     def _fetch_ring(self):
         """
@@ -289,16 +302,27 @@ class RingNode(object):
     def remove(self):
         """
         Remove the node from the ring.
+
+        To leave the ring while the node runs, use `stop()`.
         """
-        pipeline = self._conn.pipeline()
+        # Hold the lock, so that an `update` that fetched the ring before the
+        # ZREM cannot publish its ranges after the empty state.
+        with self._state_lock:
+            self._removal_count += 1
+            # Own no keys from now on, even if the ZREM fails.
+            self._state = _EMPTY_STATE
 
-        for replica in self._replicas:
-            pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
-        pipeline.execute()
+            try:
+                pipeline = self._conn.pipeline()
 
-        # Make sure this node won't contain any items.
-        self._node_count = 0
-        self._ranges = []
+                for replica in self._replicas:
+                    pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
+                pipeline.execute()
+            finally:
+                # A signal handler on the main thread can call `update` during
+                # the ZREM, and publish the ranges of a ring that still has
+                # this node. Then clear the state again.
+                self._state = _EMPTY_STATE
 
         self._notify()
 
@@ -321,13 +345,31 @@ class RingNode(object):
         """
         Fetches the updated ring from Redis and updates the current ranges.
         """
-        ring = self._fetch_ring()
+        # Hold the lock during the fetch too. Otherwise, a call that fetched
+        # an older ring can finish last, and the older ring wins.
+        with self._state_lock:
+            removal_count = self._removal_count
+            state = self._compute_state(self._fetch_ring())
+            # If this call runs on the main thread, a signal handler can call
+            # `remove` while this call holds the lock. Then the fetched ring
+            # can be older than the removal, so do not publish it.
+            if self._removal_count == removal_count:
+                self._state = state
+                # The signal handler can also run between the check and the
+                # assignment. Then clear the state again.
+                if self._removal_count != removal_count:
+                    self._state = _EMPTY_STATE
+
+    def _compute_state(self, ring):
+        """
+        Return the state of this node in the given ring.
+        """
         nodes = set()
         n_replicas = len(ring)
 
         own_replicas = {r[1] for r in self._replicas}
 
-        self._ranges = []
+        ranges = []
         for n, (start, replica) in enumerate(ring):
             host, pid, _ = replica.split(":")
             node = ":".join([host, pid])
@@ -336,26 +378,29 @@ class RingNode(object):
             if replica in own_replicas:
                 end = ring[(n + 1) % n_replicas][0] % RING_SIZE
                 if start < end:
-                    self._ranges.append((start, end))
+                    ranges.append((start, end))
                 elif end < start:
-                    self._ranges.append((start, RING_SIZE))
-                    self._ranges.append((0, end))
+                    ranges.append((start, RING_SIZE))
+                    ranges.append((0, end))
                 else:
-                    self._ranges.append((0, RING_SIZE))
+                    ranges.append((0, RING_SIZE))
 
-        self._node_count = len(nodes)
+        return _RingState(ranges=tuple(ranges), node_count=len(nodes))
 
     def get_ranges(self):
         """
-        Return the hash ring ranges that this node owns.
+        Return a tuple of the hash ring ranges that this node owns.
+
+        Each range is a tuple (a, b) that includes any ring point N with
+        a <= N < b.
         """
-        return self._ranges
+        return self._state.ranges
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
         """
-        return self._node_count
+        return self._state.node_count
 
     def contains(self, key):
         """
@@ -371,7 +416,7 @@ class RingNode(object):
         """
         Check whether this node is responsible for the ring point.
         """
-        for start, end in self._ranges:
+        for start, end in self._state.ranges:
             if start <= n < end:
                 return True
         return False
