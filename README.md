@@ -284,9 +284,9 @@ the following:
   longest wait is 1 second after the first error. It doubles after each
   failed attempt, up to 10 seconds.
 
-  The node passes each error to `threading.excepthook`. By default, Python
-  prints the traceback of the error to stderr. To handle the errors in another
-  way, set `threading.excepthook` in the application.
+  The node logs each failed attempt with the logger `redis_hashring`, at the
+  level `WARNING`, with the traceback. Without a logging configuration,
+  Python prints records at the level `WARNING` and higher to stderr.
 
   The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
   node misses a notice of a change of the ring, it sees the change within 10
@@ -309,3 +309,15 @@ the following:
   keys back. If the node had no successful heartbeat for 50 seconds, it
   notifies the other nodes after the next heartbeat. Then they read the ring
   and give the keys back.
+
+  The node logs one record at the level `ERROR` when it observes that its
+  ownership deadline has passed, and one at the level `INFO` when a renewal
+  restores ownership validity. Failed attempts continue to log at `WARNING`.
+  The expiry record includes the delay since the deadline, and the traceback
+  if it is observed while handling a failed attempt.
+
+  These observations happen after failed attempts and retry waits, and
+  before and after a renewal advances the deadline. If a Redis call blocks,
+  logging waits for the call to return; the ownership checks still enforce
+  the deadline while the thread is blocked. Errors in application log
+  handlers do not stop the node.
