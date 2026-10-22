@@ -523,9 +523,9 @@ class RingNode(object):
         """
         Keep the node in the ring until `stop` asks the thread to exit.
 
-        Send heartbeats periodically, update the ranges when a notice arrives,
-        and remove expired nodes periodically. Close the pub/sub object when
-        the loop ends.
+        Send heartbeats periodically, update the ranges after each heartbeat
+        and when a notice arrives, and remove expired nodes periodically.
+        Close the pub/sub object when the loop ends.
         """
         try:
             while not self._stop_requested.is_set():
@@ -537,6 +537,9 @@ class RingNode(object):
                     if self._stop_requested.is_set():
                         break
                     last_heartbeat = now
+                    # Read the ring after each heartbeat, so that missed
+                    # notices do not leave the ranges stale.
+                    self.update()
 
                 # If `stop` asked the thread to exit during the update,
                 # exit before the wait for a notice.
