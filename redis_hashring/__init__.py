@@ -2,6 +2,7 @@ import binascii
 import collections
 import contextlib
 import enum
+import math
 import operator
 import os
 import random
@@ -77,6 +78,16 @@ def _close_pubsub(pubsub):
             pubsub.close()
         except Exception:
             pass
+
+
+def _deadline_after(last_heartbeat):
+    """
+    Return the time `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds
+    after `last_heartbeat`.
+
+    `last_heartbeat` and the result are `time.monotonic` values.
+    """
+    return last_heartbeat + NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS
 
 
 class RingNode(object):
@@ -197,9 +208,9 @@ class RingNode(object):
             for _ in range(n_replicas)
         ]
 
-        # Readers take no lock, and read `self._state` once per call. Writers
-        # replace the whole state with one assignment, so a reader never sees
-        # a partial state.
+        # Readers take no lock, and read the state once per call, through
+        # `_read_state`. Writers replace the whole state with one assignment,
+        # so a reader never sees a partial state.
         self._state = _EMPTY_STATE
         # Makes sure that `update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
@@ -207,8 +218,14 @@ class RingNode(object):
         self._state_lock = threading.RLock()
         # Number of calls to `remove`. Changes only under `self._state_lock`.
         self._removal_count = 0
-        # The monotonic start time of the last heartbeat.
+        # Heartbeats can succeed while ring reads fail. Only a complete
+        # renewal extends ownership validity. The polling thread writes both
+        # timestamps; readers only check `_ownership_valid_until`.
         self._last_heartbeat_at = 0.0
+        # The deadline: the `time.monotonic` value after which readers see an
+        # empty state. Readers compare it with the time at each call, so no
+        # Redis call can delay the deadline.
+        self._ownership_valid_until = math.inf
 
     def _fetch_ring(self):
         """
@@ -442,24 +459,49 @@ class RingNode(object):
 
         return _RingState(ranges=tuple(ranges), node_count=len(nodes))
 
+    def _clear_state(self):
+        """
+        Make sure that this node owns no keys.
+        """
+        with self._state_lock:
+            self._state = _EMPTY_STATE
+
+    def _read_state(self):
+        """Return ownership only while its renewal is still valid."""
+        if time.monotonic() >= self._ownership_valid_until:
+            return _EMPTY_STATE
+        return self._state
+
     def get_ranges(self):
         """
         Return a tuple of the hash ring ranges that this node owns.
 
         Each range is a tuple (a, b) that includes any ring point N with
         a <= N < b.
+
+        While the node runs, return an empty tuple after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
-        return self._state.ranges
+        return self._read_state().ranges
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
+
+        While the node runs, return 0 after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
-        return self._state.node_count
+        return self._read_state().node_count
 
     def contains(self, key):
         """
         Check whether this node is responsible for the item.
+
+        While the node runs, return `False` after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
         return self._contains_ring_point(self.key_as_ring_point(key))
 
@@ -471,7 +513,7 @@ class RingNode(object):
         """
         Check whether this node is responsible for the ring point.
         """
-        for start, end in self._state.ranges:
+        for start, end in self._read_state().ranges:
             if start <= n < end:
                 return True
         return False
@@ -498,6 +540,8 @@ class RingNode(object):
             # From here on, the ring can hold replicas of this node, even if
             # a call raises.
             may_be_in_ring = True
+            # Take the time before each heartbeat, not after it. Thus, a slow
+            # heartbeat does not delay the deadline.
             self._last_heartbeat_at = time.monotonic()
             self.heartbeat()
 
@@ -505,6 +549,12 @@ class RingNode(object):
 
             self.cleanup()
             last_cleanup_at = time.monotonic()
+
+            # The setup worked. From now on, readers see the state only until
+            # the deadline of the last heartbeat.
+            self._ownership_valid_until = _deadline_after(
+                self._last_heartbeat_at
+            )
         except BaseException as error:
             self._setup_error = error
             _close_pubsub(pubsub)
@@ -520,6 +570,29 @@ class RingNode(object):
             self._setup_done.set()
 
         self._run_loop(pubsub, last_cleanup_at)
+
+    def _renew_ownership(self, heartbeat_started_at):
+        """
+        Renew membership and ownership, in that order.
+
+        A failed notice leaves the heartbeat timestamp unchanged, so the
+        next attempt sends the notice again. A failed ring read keeps the
+        new heartbeat timestamp but does not extend ownership validity.
+        """
+        previous_deadline = _deadline_after(self._last_heartbeat_at)
+        self.heartbeat()
+        if self._stop_requested.is_set():
+            return
+
+        # Peers may have taken over after the previous heartbeat expired.
+        if time.monotonic() >= previous_deadline:
+            self._notify()
+        self._last_heartbeat_at = heartbeat_started_at
+
+        # Refresh even without a notice: a lost pub/sub connection can miss
+        # changes. Publish the new ranges before extending their validity.
+        self.update()
+        self._ownership_valid_until = _deadline_after(heartbeat_started_at)
 
     def _wait_for_ring_change(self, pubsub):
         """Wait for notices, bounded by the next heartbeat and stop check."""
@@ -539,10 +612,7 @@ class RingNode(object):
             while not self._stop_requested.is_set():
                 now = time.monotonic()
                 if now - self._last_heartbeat_at >= POLL_INTERVAL_SECONDS:
-                    self.heartbeat()
-                    if self._stop_requested.is_set():
-                        break
-                    self._last_heartbeat_at = now
+                    self._renew_ownership(now)
                 if self._stop_requested.is_set():
                     break
 
@@ -555,6 +625,10 @@ class RingNode(object):
                     last_cleanup_at = time.monotonic()
         finally:
             _close_pubsub(pubsub)
+            # Clear ownership before removing the deadline, so readers cannot
+            # see stale ranges after the polling thread exits.
+            self._clear_state()
+            self._ownership_valid_until = math.inf
 
     @contextlib.contextmanager
     def _hold_lifecycle_lock(self):

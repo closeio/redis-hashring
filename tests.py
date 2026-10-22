@@ -1,6 +1,7 @@
 import itertools
 import socket
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -625,3 +626,107 @@ def test_start_raises_setup_error_when_remove_fails(redis):
                 node.start()
 
     assert exc_info.value is error
+
+
+def wait_for(condition, timeout=5):
+    """
+    Wait until `condition()` returns a true value. Fail after `timeout`
+    seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"The condition is still false after {timeout} s.")
+        time.sleep(0.01)
+
+
+class BlockingCall:
+    """
+    A stand-in for a method of `RingNode`.
+
+    The first call sets `started`, waits for `release`, and then runs the
+    real method. Each later call runs the real method at once.
+    """
+
+    def __init__(self, method):
+        self.method = method
+        self.call_count = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self):
+        self.call_count += 1
+        if self.call_count == 1:
+            self.started.set()
+            self.release.wait()
+        return self.method()
+
+
+@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_gives_up_keys_while_heartbeat_blocks(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        ranges = node.get_ranges()
+        heartbeat = BlockingCall(node.heartbeat)
+        node.heartbeat = heartbeat
+        # The number of heartbeats at each notice.
+        notices = []
+        original_notify = node._notify
+
+        def notify():
+            notices.append(heartbeat.call_count)
+            original_notify()
+
+        node._notify = notify
+
+        try:
+            assert heartbeat.started.wait(timeout=5)
+            # The thread waits in `heartbeat`. After the deadline of 0.4 s,
+            # readers see no keys.
+            wait_for(lambda: node.get_ranges() == ())
+            assert node.get_node_count() == 0
+            assert node.contains("item") is False
+        finally:
+            heartbeat.release.set()
+
+        # The heartbeat ends after the deadline, so the node notifies the
+        # other nodes right after it. Then the node gets its keys back.
+        wait_for(lambda: node.get_ranges() == ranges)
+        # The first notice came right after the heartbeat that blocked.
+        assert notices[0] == 1
+
+
+@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
+def test_node_reads_ring_after_each_heartbeat(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        # Another node joins, and the notice gets lost.
+        redis.zadd(TEST_KEY, {f"0:{OTHER_REPLICA}": time.time()})
+
+        wait_for(lambda: node.get_node_count() == 2)
+
+
+@pytest.mark.parametrize("failed_step", ["_notify", "update"])
+def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
+    node = RingNode(redis, TEST_KEY)
+    node.heartbeat()
+    node.update()
+    started_at = time.monotonic()
+    previous_heartbeat = started_at - redis_hashring.NODE_TIMEOUT_SECONDS
+    node._last_heartbeat_at = previous_heartbeat
+    node._ownership_valid_until = redis_hashring._deadline_after(
+        previous_heartbeat
+    )
+    previous_deadline = node._ownership_valid_until
+    assert node.get_ranges() == ()
+
+    with patch.object(
+        node, failed_step, side_effect=RedisConnectionError("renewal failed")
+    ):
+        with pytest.raises(RedisConnectionError, match="^renewal failed$"):
+            node._renew_ownership(started_at)
+
+    assert node._ownership_valid_until == previous_deadline
+    assert node.get_ranges() == ()
+    assert node._last_heartbeat_at == (
+        previous_heartbeat if failed_step == "_notify" else started_at
+    )

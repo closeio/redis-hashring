@@ -242,10 +242,9 @@ the following:
   If the removal also fails, the replicas stay in the ring. The other nodes
   can count these replicas, and then no node owns the ranges of the replicas.
   A replica expires 60 seconds after its last heartbeat, but the other nodes
-  see the expiry only when the ring changes. If nothing else changes, the
-  change comes when an active node removes the expired replicas. Each active
-  node does this every 120 to 130 seconds. Thus, the ranges can stay without
-  an owner for up to about 190 seconds after the last heartbeat.
+  see the expiry only when they read the ring. Each active node reads the
+  ring after each heartbeat, every 10 seconds. Thus, the ranges can stay
+  without an owner for up to about 70 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
   `stop()`, or after a `start()` call that cannot join the ring, the node can
@@ -276,3 +275,22 @@ the following:
   Redis calls that the thread runs, if any. The socket timeouts of the Redis
   client limit these waits. Without socket timeouts, both methods can wait
   forever if Redis does not respond.
+
+- Redis errors
+
+  The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
+  node misses a notice of a change of the ring, it sees the change within 10
+  seconds.
+
+  If the node cannot send a heartbeat and then read the ring for 50 seconds,
+  it gives up its keys. Then `contains()` returns `False` for all keys,
+  `get_ranges()` returns an empty tuple, and `get_node_count()` returns 0.
+  The other nodes see the node as dead after 60 seconds, so the node gives up
+  its keys first. Each heartbeat stores the time on the clock of the node, and
+  the other nodes compare it with their own clocks. Thus, the node gives up its
+  keys first only if the clocks of the hosts differ by less than 10 seconds. If
+  the clocks differ by more, two nodes can own the same keys at the same time.
+
+  These three methods compare the current time with the 50-second deadline
+  at each call. Thus, the node gives up its keys on time, even if a Redis call
+  of the thread blocks.
