@@ -1012,6 +1012,33 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
         assert redis.zcard(TEST_KEY) == 2
 
 
+@pytest.mark.parametrize("failed_step", ["_notify", "update"])
+def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
+    node = RingNode(redis, TEST_KEY)
+    node.heartbeat()
+    node.update()
+    started_at = time.monotonic()
+    previous_heartbeat = started_at - redis_hashring.NODE_TIMEOUT_SECONDS
+    node._last_heartbeat_at = previous_heartbeat
+    node._ownership_valid_until = redis_hashring._deadline_after(
+        previous_heartbeat
+    )
+    previous_deadline = node._ownership_valid_until
+    assert node.get_ranges() == ()
+
+    with patch.object(
+        node, failed_step, side_effect=RedisConnectionError("renewal failed")
+    ):
+        with pytest.raises(RedisConnectionError, match="^renewal failed$"):
+            node._renew_ownership(started_at)
+
+    assert node._ownership_valid_until == previous_deadline
+    assert node.get_ranges() == ()
+    assert node._last_heartbeat_at == (
+        previous_heartbeat if failed_step == "_notify" else started_at
+    )
+
+
 # Keep the default `POLL_INTERVAL_SECONDS`, so that the first failed `update`
 # comes from a notice, not from a heartbeat.
 @ignore_thread_errors
