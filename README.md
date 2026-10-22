@@ -268,7 +268,8 @@ the following:
 
   The thread checks for a request to stop at least once per second. Thus,
   `stop()` takes up to 1 second, plus the time of the Redis calls that the
-  thread runs before the check.
+  thread runs before the check. After a Redis error, these calls include a new
+  subscription, which can wait up to 10 seconds for its confirmation.
 
   For the other Redis calls, `start()` and `stop()` have no timeout of their
   own. `start()` waits for the node to join the ring. `stop()` waits for the
@@ -277,6 +278,15 @@ the following:
   forever if Redis does not respond.
 
 - Redis errors
+
+  After `start()` returns, the node tries again after each error, until
+  `stop()`. Before each new attempt, the node waits for a random time. The
+  longest wait is 1 second after the first error. It doubles after each
+  failed attempt, up to 10 seconds.
+
+  The node logs each failed attempt with the logger `redis_hashring`, at the
+  level `WARNING`, with the traceback. Without a logging configuration,
+  Python prints records at the level `WARNING` and higher to stderr.
 
   The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
   node misses a notice of a change of the ring, it sees the change within 10
@@ -294,3 +304,20 @@ the following:
   These three methods compare the current time with the 50-second deadline
   at each call. Thus, the node gives up its keys on time, even if a Redis call
   of the thread blocks.
+
+  When Redis is available again, the node joins the ring again and gets its
+  keys back. If the node had no successful heartbeat for 50 seconds, it
+  notifies the other nodes after the next heartbeat. Then they read the ring
+  and give the keys back.
+
+  The node logs one record at the level `ERROR` when it observes that its
+  ownership deadline has passed, and one at the level `INFO` when a renewal
+  restores ownership validity. Failed attempts continue to log at `WARNING`.
+  The expiry record includes the delay since the deadline, and the traceback
+  if it is observed while handling a failed attempt.
+
+  These observations happen after failed attempts and retry waits, and
+  before and after a renewal advances the deadline. If a Redis call blocks,
+  logging waits for the call to return; the ownership checks still enforce
+  the deadline while the thread is blocked. Errors in application log
+  handlers do not stop the node.

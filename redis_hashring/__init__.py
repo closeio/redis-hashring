@@ -2,6 +2,7 @@ import binascii
 import collections
 import contextlib
 import enum
+import logging
 import math
 import operator
 import os
@@ -44,6 +45,13 @@ SUBSCRIBE_TIMEOUT_SECONDS = 10
 # How often the thread checks whether `stop` asked it to exit.
 STOP_CHECK_INTERVAL_SECONDS = 1
 
+# The retry interval after the first error.
+RETRY_INTERVAL_MIN_SECONDS = 1
+
+# The longest retry interval. It equals `POLL_INTERVAL_SECONDS`, so that a
+# retry waits no longer than the interval between two heartbeats.
+RETRY_INTERVAL_MAX_SECONDS = POLL_INTERVAL_SECONDS
+
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
 #   includes any N matching a <= N < b.
@@ -51,6 +59,9 @@ STOP_CHECK_INTERVAL_SECONDS = 1
 _RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
 
 _EMPTY_STATE = _RingState(ranges=(), node_count=0)
+
+# Applications can configure this logger without changing thread error hooks.
+_logger = logging.getLogger("redis_hashring")
 
 
 def _hash_with_xxhash(key):
@@ -226,6 +237,8 @@ class RingNode(object):
         # empty state. Readers compare it with the time at each call, so no
         # Redis call can delay the deadline.
         self._ownership_valid_until = math.inf
+        # Logging state, observed only by the polling thread.
+        self._reported_ownership_expired = False
 
     def _fetch_ring(self):
         """
@@ -518,6 +531,41 @@ class RingNode(object):
                 return True
         return False
 
+    def _wait_before_retry(self, retry_interval):
+        """
+        Wait before the next attempt after an error.
+
+        Wait for a random time between half `retry_interval` and the full
+        interval, so that the nodes do not all try again at the same time.
+        Return early if `self._stop_requested` is set.
+        """
+        self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
+
+    def _log_ownership_change(self, *, exc_info=None):
+        """Report each expiry and recovery once, when the thread observes it."""
+        now = time.monotonic()
+        expired = now >= self._ownership_valid_until
+        if expired == self._reported_ownership_expired:
+            return
+        self._reported_ownership_expired = expired
+
+        # Application log handlers must not interrupt membership maintenance.
+        with contextlib.suppress(Exception):
+            if expired:
+                _logger.error(
+                    "The node in the ring %r gave up its keys %.1f seconds"
+                    " ago, after %s seconds without a successful heartbeat"
+                    " and read of the ring.",
+                    self._key,
+                    now - self._ownership_valid_until,
+                    NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS,
+                    exc_info=exc_info,
+                )
+            else:
+                _logger.info(
+                    "The node in the ring %r got its keys back.", self._key
+                )
+
     def _poll(self):
         """
         Keep the node in the ring until `stop` asks the thread to exit.
@@ -555,6 +603,7 @@ class RingNode(object):
             self._ownership_valid_until = _deadline_after(
                 self._last_heartbeat_at
             )
+            self._reported_ownership_expired = False
         except BaseException as error:
             self._setup_error = error
             _close_pubsub(pubsub)
@@ -592,7 +641,11 @@ class RingNode(object):
         # Refresh even without a notice: a lost pub/sub connection can miss
         # changes. Publish the new ranges before extending their validity.
         self.update()
+        # A blocking Redis call may have let ownership expire without an
+        # exception. Observe that transition before advancing the deadline.
+        self._log_ownership_change()
         self._ownership_valid_until = _deadline_after(heartbeat_started_at)
+        self._log_ownership_change()
 
     def _wait_for_ring_change(self, pubsub):
         """Wait for notices, bounded by the next heartbeat and stop check."""
@@ -607,22 +660,52 @@ class RingNode(object):
             self.update()
 
     def _run_loop(self, pubsub, last_cleanup_at):
-        """Maintain the ring until stopped."""
+        """Maintain the ring, retrying failed attempts until stopped."""
+        retry_interval = RETRY_INTERVAL_MIN_SECONDS
         try:
             while not self._stop_requested.is_set():
-                now = time.monotonic()
-                if now - self._last_heartbeat_at >= POLL_INTERVAL_SECONDS:
-                    self._renew_ownership(now)
-                if self._stop_requested.is_set():
-                    break
+                try:
+                    resubscribed = pubsub is None
+                    if resubscribed:
+                        pubsub = self._subscribe()
+                        if self._stop_requested.is_set():
+                            break
 
-                self._wait_for_ring_change(pubsub)
-                if (
-                    time.monotonic() - last_cleanup_at
-                    >= CLEANUP_INTERVAL_SECONDS
-                ):
-                    self.cleanup()
-                    last_cleanup_at = time.monotonic()
+                    now = time.monotonic()
+                    if (
+                        resubscribed
+                        or now - self._last_heartbeat_at
+                        >= POLL_INTERVAL_SECONDS
+                    ):
+                        self._renew_ownership(now)
+                    if self._stop_requested.is_set():
+                        break
+
+                    self._wait_for_ring_change(pubsub)
+                    if (
+                        time.monotonic() - last_cleanup_at
+                        >= CLEANUP_INTERVAL_SECONDS
+                    ):
+                        self.cleanup()
+                        last_cleanup_at = time.monotonic()
+
+                    retry_interval = RETRY_INTERVAL_MIN_SECONDS
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _logger.warning(
+                            "An attempt of the node in the ring %r failed."
+                            " The node will try again.",
+                            self._key,
+                            exc_info=True,
+                        )
+                    self._log_ownership_change(exc_info=True)
+                    _close_pubsub(pubsub)
+                    pubsub = None
+                    self._wait_before_retry(retry_interval)
+                    self._log_ownership_change(exc_info=True)
+                    retry_interval = min(
+                        retry_interval * 2, RETRY_INTERVAL_MAX_SECONDS
+                    )
         finally:
             _close_pubsub(pubsub)
             # Clear ownership before removing the deadline, so readers cannot
