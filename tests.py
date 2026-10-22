@@ -1,8 +1,7 @@
 import itertools
-import os
 import socket
 import threading
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import pytest
 from redis import Redis
@@ -12,6 +11,7 @@ from redis.exceptions import (
     TimeoutError as RedisTimeoutError,
 )
 
+import redis_hashring
 from redis_hashring import (
     RING_SIZE,
     SUBSCRIBE_TIMEOUT_SECONDS,
@@ -29,6 +29,15 @@ def redis():
     redis = Redis()
     yield redis
     redis.delete(TEST_KEY)
+
+
+@pytest.fixture(autouse=True)
+def short_stop_check_interval():
+    """
+    Make the thread check for a request to stop every 0.05 s.
+    """
+    with patch.object(redis_hashring, "STOP_CHECK_INTERVAL_SECONDS", 0.05):
+        yield
 
 
 def get_node(redis, n_replicas, total_replicas, hash_algorithm):
@@ -512,8 +521,6 @@ def test_start_after_stop(redis):
     with node:
         first_polling_thread = node._polling_thread
     assert not first_polling_thread.is_alive()
-    assert node._stop_polling_fd_r is None
-    assert node._stop_polling_fd_w is None
 
     with node:
         assert node.get_node_count() == 1
@@ -538,8 +545,6 @@ def test_start_raises_when_setup_fails(redis):
     close.assert_called_once()
     assert set(threading.enumerate()) <= threads_before
     assert node._polling_thread is None
-    assert node._stop_polling_fd_r is None
-    assert node._stop_polling_fd_w is None
     assert node._setup_error is None
     # No thread runs, so `stop` does not wait.
     join_thread(start_thread(node.stop))
@@ -620,37 +625,3 @@ def test_start_raises_setup_error_when_remove_fails(redis):
                 node.start()
 
     assert exc_info.value is error
-
-
-# The thread of the node ends with an error. pytest warns about each error
-# that ends a thread.
-@pytest.mark.filterwarnings(
-    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
-)
-def test_stop_closes_pipe_of_dead_thread(redis):
-    node = RingNode(redis, TEST_KEY)
-    node.start()
-    try:
-        with patch.object(
-            PubSub, "get_message", side_effect=RedisConnectionError()
-        ):
-            # The loop calls `get_message` for this notice, and the thread
-            # dies.
-            redis.publish(TEST_KEY, "*")
-            join_thread(node._polling_thread)
-
-        stop_polling_fd_r = node._stop_polling_fd_r
-        stop_polling_fd_w = node._stop_polling_fd_w
-        with patch.object(os, "close", wraps=os.close) as close:
-            join_thread(start_thread(node.stop))
-    except BaseException:
-        # If an assertion fails, the thread can still run. Stop it, so that
-        # it does not change the ring in the next tests.
-        node.stop()
-        raise
-
-    close.assert_has_calls(
-        [call(stop_polling_fd_r), call(stop_polling_fd_w)], any_order=True
-    )
-    assert node._stop_polling_fd_r is None
-    assert node._stop_polling_fd_w is None
