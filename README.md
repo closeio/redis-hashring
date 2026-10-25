@@ -242,10 +242,9 @@ the following:
   If the removal also fails, the replicas stay in the ring. The other nodes
   can count these replicas, and then no node owns the ranges of the replicas.
   A replica expires 60 seconds after its last heartbeat, but the other nodes
-  see the expiry only when the ring changes. If nothing else changes, the
-  change comes when an active node removes the expired replicas. Each active
-  node does this every 120 to 130 seconds. Thus, the ranges can stay without
-  an owner for up to about 190 seconds after the last heartbeat.
+  see the expiry only when they read the ring. Each active node reads the
+  ring after each heartbeat, every 10 seconds. Thus, the ranges can stay
+  without an owner for up to about 70 seconds after the last heartbeat.
 
   If the node already started, `start()` raises `RuntimeError`. After
   `stop()`, or after a `start()` call that cannot join the ring, the node can
@@ -276,3 +275,9 @@ the following:
   Redis calls that the thread runs, if any. The socket timeouts of the Redis
   client limit these waits. Without socket timeouts, both methods can wait
   forever if Redis does not respond.
+
+- Redis errors
+
+  The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
+  node misses a notice of a change of the ring, it sees the change within 10
+  seconds.

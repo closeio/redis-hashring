@@ -533,9 +533,15 @@ class RingNode(object):
         self._run_loop(pubsub, last_cleanup_at)
 
     def _renew_ownership(self, heartbeat_started_at):
-        """Send a heartbeat and record when it started."""
+        """Send a heartbeat and refresh ring ownership."""
         self.heartbeat()
+        if self._stop_requested.is_set():
+            return
         self._last_heartbeat_at = heartbeat_started_at
+
+        # Refresh even without a notice: a lost pub/sub connection can miss
+        # changes.
+        self.update()
 
     def _wait_for_ring_change(self, pubsub):
         """Wait for notices, bounded by the next heartbeat and stop check."""

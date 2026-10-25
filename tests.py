@@ -1,6 +1,7 @@
 import itertools
 import socket
 import threading
+import time
 from unittest.mock import Mock, patch
 
 import pytest
@@ -625,3 +626,24 @@ def test_start_raises_setup_error_when_remove_fails(redis):
                 node.start()
 
     assert exc_info.value is error
+
+
+def wait_for(condition, timeout=5):
+    """
+    Wait until `condition()` returns a true value. Fail after `timeout`
+    seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            pytest.fail(f"The condition is still false after {timeout} s.")
+        time.sleep(0.01)
+
+
+@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
+def test_node_reads_ring_after_each_heartbeat(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        # Another node joins, and the notice gets lost.
+        redis.zadd(TEST_KEY, {f"0:{OTHER_REPLICA}": time.time()})
+
+        wait_for(lambda: node.get_node_count() == 2)
