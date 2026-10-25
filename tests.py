@@ -899,6 +899,29 @@ def test_node_gives_up_keys_while_update_fails(redis):
 
 @pytest.mark.usefixtures("short_intervals")
 @patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_logs_expiry_after_blocked_heartbeat(redis, caplog):
+    caplog.set_level(logging.INFO, logger="redis_hashring")
+    with RingNode(redis, TEST_KEY) as node:
+        heartbeat = BlockingCall(node.heartbeat)
+        node.heartbeat = heartbeat
+        try:
+            assert heartbeat.started.wait(timeout=5)
+            wait_for(lambda: node.get_ranges() == ())
+            time.sleep(0.2)
+            assert log_records(caplog) == []
+        finally:
+            heartbeat.release.set()
+        wait_for(lambda: log_records(caplog, logging.INFO))
+
+    error_record, info_record = log_records(caplog)
+    assert error_record.levelno == logging.ERROR
+    assert error_record.args[1] >= 0.2
+    assert error_record.exc_info is None
+    assert info_record.levelno == logging.INFO
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
 def test_thread_resets_deadline_when_it_exits(redis):
     node = RingNode(redis, TEST_KEY)
     with node:

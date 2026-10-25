@@ -309,3 +309,10 @@ the following:
   keys back. If the node had no successful heartbeat for 50 seconds, it
   notifies the other nodes after the next heartbeat. Then they read the ring
   and give the keys back.
+
+  The node logs one record at the level `ERROR` when a renewal observes
+  that its ownership deadline has passed, including the delay since
+  expiry, and one at the level `INFO` when validity is restored. It
+  checks before and after a renewal advances the deadline. If Redis
+  blocks, logging waits for the call to return; ownership checks still
+  enforce the deadline while the thread is blocked.
