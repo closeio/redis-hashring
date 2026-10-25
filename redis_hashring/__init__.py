@@ -2,6 +2,7 @@ import binascii
 import collections
 import contextlib
 import enum
+import logging
 import math
 import operator
 import os
@@ -44,6 +45,9 @@ SUBSCRIBE_TIMEOUT_SECONDS = 10
 # How often the thread checks whether `stop` asked it to exit.
 STOP_CHECK_INTERVAL_SECONDS = 1
 
+# The retry interval after the first error.
+RETRY_INTERVAL_MIN_SECONDS = 1
+
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
 #   includes any N matching a <= N < b.
@@ -51,6 +55,9 @@ STOP_CHECK_INTERVAL_SECONDS = 1
 _RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
 
 _EMPTY_STATE = _RingState(ranges=(), node_count=0)
+
+# Applications can configure this logger without changing thread error hooks.
+_logger = logging.getLogger("redis_hashring")
 
 
 def _hash_with_xxhash(key):
@@ -607,20 +614,42 @@ class RingNode(object):
             self.update()
 
     def _run_loop(self, pubsub, last_cleanup_at):
-        """Maintain the ring until stopped."""
+        """Maintain the ring, retrying failed attempts until stopped."""
         try:
             while not self._stop_requested.is_set():
-                now = time.monotonic()
-                if now - self._last_heartbeat_at >= POLL_INTERVAL_SECONDS:
-                    self._renew_ownership(now)
-                if self._stop_requested.is_set():
-                    break
+                try:
+                    resubscribed = pubsub is None
+                    if resubscribed:
+                        pubsub = self._subscribe()
+                        if self._stop_requested.is_set():
+                            break
 
-                self._wait_for_ring_change(pubsub)
-                now = time.monotonic()
-                if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
-                    self.cleanup()
-                    last_cleanup_at = now
+                    now = time.monotonic()
+                    if (
+                        resubscribed
+                        or now - self._last_heartbeat_at
+                        >= POLL_INTERVAL_SECONDS
+                    ):
+                        self._renew_ownership(now)
+                    if self._stop_requested.is_set():
+                        break
+
+                    self._wait_for_ring_change(pubsub)
+                    now = time.monotonic()
+                    if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
+                        self.cleanup()
+                        last_cleanup_at = now
+
+                except Exception:
+                    _logger.warning(
+                        "An attempt of the node in the ring %r failed."
+                        " The node will try again.",
+                        self._key,
+                        exc_info=True,
+                    )
+                    _close_pubsub(pubsub)
+                    pubsub = None
+                    self._stop_requested.wait(RETRY_INTERVAL_MIN_SECONDS)
         finally:
             _close_pubsub(pubsub)
             # Clear ownership before removing the deadline, so readers cannot
