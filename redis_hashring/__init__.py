@@ -197,9 +197,9 @@ class RingNode(object):
             for _ in range(n_replicas)
         ]
 
-        # Readers take no lock, and read `self._state` once per call. Writers
-        # replace the whole state with one assignment, so a reader never sees
-        # a partial state.
+        # Readers take no lock, and read the state once per call, through
+        # `_read_state`. Writers replace the whole state with one assignment,
+        # so a reader never sees a partial state.
         self._state = _EMPTY_STATE
         # Makes sure that `update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
@@ -442,6 +442,10 @@ class RingNode(object):
 
         return _RingState(ranges=tuple(ranges), node_count=len(nodes))
 
+    def _read_state(self):
+        """Return the current ownership snapshot."""
+        return self._state
+
     def get_ranges(self):
         """
         Return a tuple of the hash ring ranges that this node owns.
@@ -449,13 +453,13 @@ class RingNode(object):
         Each range is a tuple (a, b) that includes any ring point N with
         a <= N < b.
         """
-        return self._state.ranges
+        return self._read_state().ranges
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
         """
-        return self._state.node_count
+        return self._read_state().node_count
 
     def contains(self, key):
         """
@@ -471,7 +475,7 @@ class RingNode(object):
         """
         Check whether this node is responsible for the ring point.
         """
-        for start, end in self._state.ranges:
+        for start, end in self._read_state().ranges:
             if start <= n < end:
                 return True
         return False
