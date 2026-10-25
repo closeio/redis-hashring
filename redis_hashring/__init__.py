@@ -355,6 +355,20 @@ class RingNode(object):
         """
         self._conn.publish(self._key, "*")
 
+    def _subscribe(self, pubsub):
+        """Subscribe and wait for Redis to confirm the subscription."""
+        pubsub.subscribe(self._key)
+        # Wait for the reply to the subscription before `update`. After
+        # the reply, Redis sends each change of the ring to this
+        # connection, so no change after `update` gets lost. Wait with a
+        # limit of our own, so that the setup ends even if Redis does not
+        # reply.
+        if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
+            raise RedisTimeoutError(
+                f"No reply to the subscription to {self._key!r}"
+                f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
+            )
+
     def cleanup(self):
         """
         Removes expired nodes from the ring.
@@ -465,17 +479,7 @@ class RingNode(object):
             # Keep subscribe messages, so that `get_message` returns the reply
             # to the subscription.
             pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
-            pubsub.subscribe(self._key)
-            # Wait for the reply to the subscription before `update`. After
-            # the reply, Redis sends each change of the ring to this
-            # connection, so no change after `update` gets lost. Wait with a
-            # limit of our own, so that the setup ends even if Redis does not
-            # reply.
-            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
-                raise RedisTimeoutError(
-                    f"No reply to the subscription to {self._key!r}"
-                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
-                )
+            self._subscribe(pubsub)
             pubsub_fd = pubsub.connection._sock.fileno()
 
             last_heartbeat = time.time()
