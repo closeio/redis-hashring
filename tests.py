@@ -728,6 +728,7 @@ def short_intervals():
         redis_hashring,
         POLL_INTERVAL_SECONDS=0.1,
         RETRY_INTERVAL_MIN_SECONDS=0.1,
+        RETRY_INTERVAL_MAX_SECONDS=0.1,
     ):
         yield
 
@@ -762,6 +763,7 @@ def test_thread_logs_errors(redis, caplog):
 @patch.multiple(
     redis_hashring,
     RETRY_INTERVAL_MIN_SECONDS=0.1,
+    RETRY_INTERVAL_MAX_SECONDS=0.1,
 )
 def test_thread_survives_closed_pubsub_connection(redis):
     with RingNode(redis, TEST_KEY) as node1:
@@ -886,6 +888,32 @@ def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     )
 
 
+# Keep the default `POLL_INTERVAL_SECONDS`, so that the first failed `update`
+# comes from a notice, not from a heartbeat.
+@patch.multiple(
+    redis_hashring,
+    RETRY_INTERVAL_MIN_SECONDS=0.1,
+    RETRY_INTERVAL_MAX_SECONDS=0.1,
+)
+def test_thread_survives_failed_update(redis):
+    with RingNode(redis, TEST_KEY) as node1:
+        fetch_ring = FailingCall(node1._fetch_ring, failures_left=math.inf)
+        node1._fetch_ring = fetch_ring
+
+        # Node 1 cannot read the ring after node 2 joins.
+        with patch.object(socket, "gethostname", return_value="host2"):
+            node2 = RingNode(redis, TEST_KEY)
+        node2.heartbeat()
+        wait_for(lambda: fetch_ring.failure_count > 0)
+        assert node1.get_node_count() == 1
+
+        # The thread tries again, and reads the ring.
+        fetch_ring.heal()
+        wait_for(lambda: node1.get_node_count() == 2)
+        assert node1._polling_thread.is_alive()
+        node2.remove()
+
+
 @patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
 @patch.object(redis_hashring, "RETRY_INTERVAL_MIN_SECONDS", 10)
 def test_stop_while_heartbeat_fails(redis):
@@ -942,6 +970,7 @@ def test_thread_exits_when_stop_arrives_during_subscription(redis):
     redis_hashring,
     STOP_CHECK_INTERVAL_SECONDS=10,
     RETRY_INTERVAL_MIN_SECONDS=0.1,
+    RETRY_INTERVAL_MAX_SECONDS=0.1,
 )
 def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     node = RingNode(redis, TEST_KEY)

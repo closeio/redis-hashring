@@ -48,6 +48,10 @@ STOP_CHECK_INTERVAL_SECONDS = 1
 # The retry interval after the first error.
 RETRY_INTERVAL_MIN_SECONDS = 1
 
+# The longest retry interval. It equals `POLL_INTERVAL_SECONDS`, so that a
+# retry waits no longer than the interval between two heartbeats.
+RETRY_INTERVAL_MAX_SECONDS = POLL_INTERVAL_SECONDS
+
 # The state of a node:
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
 #   includes any N matching a <= N < b.
@@ -625,6 +629,7 @@ class RingNode(object):
 
     def _run_loop(self, pubsub, last_cleanup_at):
         """Maintain the ring, retrying failed attempts until stopped."""
+        retry_interval = RETRY_INTERVAL_MIN_SECONDS
         try:
             while not self._stop_requested.is_set():
                 try:
@@ -650,6 +655,7 @@ class RingNode(object):
                         self.cleanup()
                         last_cleanup_at = now
 
+                    retry_interval = RETRY_INTERVAL_MIN_SECONDS
                 except Exception:
                     _logger.warning(
                         "An attempt of the node in the ring %r failed."
@@ -659,7 +665,10 @@ class RingNode(object):
                     )
                     _close_pubsub(pubsub)
                     pubsub = None
-                    self._wait_before_retry(RETRY_INTERVAL_MIN_SECONDS)
+                    self._wait_before_retry(retry_interval)
+                    retry_interval = min(
+                        retry_interval * 2, RETRY_INTERVAL_MAX_SECONDS
+                    )
         finally:
             _close_pubsub(pubsub)
             # Clear ownership before removing the deadline, so readers cannot
