@@ -519,6 +519,10 @@ class RingNode(object):
         finally:
             self._setup_done.set()
 
+        self._run_loop(pubsub, pubsub_fd, last_heartbeat, last_cleanup)
+
+    def _run_loop(self, pubsub, pubsub_fd, last_heartbeat, last_cleanup):
+        """Maintain the ring until stopped."""
         try:
             while True:
                 # Since Redis' `listen` method blocks, we use `select` to
