@@ -595,8 +595,8 @@ class RingNode(object):
 
             self.update()
 
-            self.cleanup()
             last_cleanup_at = time.monotonic()
+            self.cleanup()
 
             # The setup worked. From now on, readers see the state only until
             # the deadline of the last heartbeat.
@@ -682,12 +682,10 @@ class RingNode(object):
                         break
 
                     self._wait_for_ring_change(pubsub)
-                    if (
-                        time.monotonic() - last_cleanup_at
-                        >= CLEANUP_INTERVAL_SECONDS
-                    ):
+                    now = time.monotonic()
+                    if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
                         self.cleanup()
-                        last_cleanup_at = time.monotonic()
+                        last_cleanup_at = now
 
                     retry_interval = RETRY_INTERVAL_MIN_SECONDS
                 except Exception:
