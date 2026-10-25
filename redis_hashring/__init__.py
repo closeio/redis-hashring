@@ -205,6 +205,8 @@ class RingNode(object):
         self._state_lock = threading.RLock()
         # Number of calls to `remove`. Changes only under `self._state_lock`.
         self._removal_count = 0
+        # The monotonic start time of the last heartbeat.
+        self._last_heartbeat_at = 0.0
 
     def _fetch_ring(self):
         """
@@ -495,10 +497,10 @@ class RingNode(object):
             pubsub = self._subscribe()
             pubsub_fd = pubsub.connection._sock.fileno()
 
-            last_heartbeat = time.monotonic()
             # From here on, the ring can hold replicas of this node, even if
             # a call raises.
             may_be_in_ring = True
+            self._last_heartbeat_at = time.monotonic()
             self.heartbeat()
 
             self.update()
@@ -519,9 +521,9 @@ class RingNode(object):
         finally:
             self._setup_done.set()
 
-        self._run_loop(pubsub, pubsub_fd, last_heartbeat, last_cleanup_at)
+        self._run_loop(pubsub, pubsub_fd, last_cleanup_at)
 
-    def _run_loop(self, pubsub, pubsub_fd, last_heartbeat, last_cleanup_at):
+    def _run_loop(self, pubsub, pubsub_fd, last_cleanup_at):
         """Maintain the ring until stopped."""
         try:
             while True:
@@ -530,7 +532,7 @@ class RingNode(object):
                 timeout = max(
                     0.0,
                     POLL_INTERVAL_SECONDS
-                    - (time.monotonic() - last_heartbeat),
+                    - (time.monotonic() - self._last_heartbeat_at),
                 )
                 r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
@@ -544,7 +546,7 @@ class RingNode(object):
                         pass
                     self.update()
 
-                last_heartbeat = time.monotonic()
+                self._last_heartbeat_at = time.monotonic()
                 self.heartbeat()
 
                 now = time.monotonic()
