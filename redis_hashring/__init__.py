@@ -66,6 +66,17 @@ def _decode(data):
         return data
 
 
+def _close_pubsub(pubsub):
+    """
+    Close the pub/sub object, if any, and ignore errors from the close.
+    """
+    if pubsub is not None:
+        try:
+            pubsub.close()
+        except Exception:
+            pass
+
+
 class RingNode(object):
     """
     A node in a Redis hash ring.
@@ -479,12 +490,7 @@ class RingNode(object):
             self.cleanup()
         except BaseException as error:
             self._setup_error = error
-            if pubsub is not None:
-                try:
-                    pubsub.close()
-                except Exception:
-                    # Keep the setup error, and go on to remove the node.
-                    pass
+            _close_pubsub(pubsub)
             if may_be_in_ring:
                 try:
                     # Undo the setup steps that worked before the error.
