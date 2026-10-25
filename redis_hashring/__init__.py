@@ -442,6 +442,13 @@ class RingNode(object):
 
         return _RingState(ranges=tuple(ranges), node_count=len(nodes))
 
+    def _clear_state(self):
+        """
+        Make sure that this node owns no keys.
+        """
+        with self._state_lock:
+            self._state = _EMPTY_STATE
+
     def _read_state(self):
         """Return the current ownership snapshot."""
         return self._state
@@ -559,6 +566,7 @@ class RingNode(object):
                     last_cleanup_at = now
         finally:
             _close_pubsub(pubsub)
+            self._clear_state()
 
     @contextlib.contextmanager
     def _hold_lifecycle_lock(self):
