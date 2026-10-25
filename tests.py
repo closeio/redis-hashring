@@ -1060,6 +1060,49 @@ def test_node_reads_ring_after_each_heartbeat(redis):
         wait_for(lambda: node.get_node_count() == 2)
 
 
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+@pytest.mark.parametrize("clean_up_expired_node", [False, True])
+def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
+    quarter = RING_SIZE // 4
+    with patch.object(socket, "gethostname", return_value="host1"):
+        node1 = RingNode(redis, TEST_KEY, n_replicas=1)
+    with patch.object(socket, "gethostname", return_value="host2"):
+        node2 = RingNode(redis, TEST_KEY, n_replicas=1)
+    node1._replicas = [(quarter, node1._replicas[0][1])]
+    node2._replicas = [(3 * quarter, node2._replicas[0][1])]
+    ranges1 = ((quarter, 3 * quarter),)
+    ranges2 = ((3 * quarter, RING_SIZE), (0, quarter))
+
+    with node1, node2:
+        wait_for(lambda: node1.get_ranges() == ranges1)
+        assert node2.get_ranges() == ranges2
+        assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
+
+        heartbeat = FailingCall(node1.heartbeat, failures_left=math.inf)
+        node1.heartbeat = heartbeat
+        wait_for(lambda: node1.get_ranges() == ())
+        assert node1.get_node_count() == 0
+        assert node1.contains("item") is False
+
+        wait_for(lambda: node2.get_ranges() == ((0, RING_SIZE),))
+        assert node2.get_node_count() == 1
+        assert node1.get_ranges() == ()
+        # Expiry changes ownership without deleting the stale replica.
+        assert redis.zcard(TEST_KEY) == 2
+        if clean_up_expired_node:
+            node2.cleanup()
+            assert redis.zcard(TEST_KEY) == 1
+
+        heartbeat.heal()
+        wait_for(
+            lambda: node1.get_ranges() == ranges1
+            and node2.get_ranges() == ranges2
+        )
+        assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
+        assert redis.zcard(TEST_KEY) == 2
+
+
 @pytest.mark.parametrize("failed_step", ["_notify", "update"])
 def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     node = RingNode(redis, TEST_KEY)
