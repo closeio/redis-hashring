@@ -5,7 +5,6 @@ import enum
 import operator
 import os
 import random
-import select
 import socket
 import threading
 import time
@@ -495,7 +494,6 @@ class RingNode(object):
             # Subscribe before `update`, so that no change of the ring after
             # `update` gets lost.
             pubsub = self._subscribe()
-            pubsub_fd = pubsub.connection._sock.fileno()
 
             # From here on, the ring can hold replicas of this node, even if
             # a call raises.
@@ -521,9 +519,9 @@ class RingNode(object):
         finally:
             self._setup_done.set()
 
-        self._run_loop(pubsub, pubsub_fd, last_cleanup_at)
+        self._run_loop(pubsub, last_cleanup_at)
 
-    def _run_loop(self, pubsub, pubsub_fd, last_cleanup_at):
+    def _run_loop(self, pubsub, last_cleanup_at):
         """Maintain the ring until stopped."""
         try:
             while not self._stop_requested.is_set():
@@ -541,9 +539,8 @@ class RingNode(object):
                     STOP_CHECK_INTERVAL_SECONDS,
                     max(0.0, next_heartbeat_at - time.monotonic()),
                 )
-                r, _, _ = select.select([pubsub_fd], [], [], timeout)
-                if pubsub_fd in r:
-                    while pubsub.get_message():
+                if pubsub.get_message(timeout=timeout) is not None:
+                    while pubsub.get_message() is not None:
                         pass
                     self.update()
                 now = time.monotonic()
