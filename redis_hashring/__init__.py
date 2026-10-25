@@ -527,8 +527,11 @@ class RingNode(object):
         """Maintain the ring until stopped."""
         try:
             while True:
-                # Since Redis' `listen` method blocks, we use `select` to
-                # inspect the underlying socket to see if there is activity.
+                now = time.monotonic()
+                if now - self._last_heartbeat_at >= POLL_INTERVAL_SECONDS:
+                    self.heartbeat()
+                    self._last_heartbeat_at = now
+
                 timeout = max(
                     0.0,
                     POLL_INTERVAL_SECONDS
@@ -537,17 +540,12 @@ class RingNode(object):
                 r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
                 )
-
                 if self._stop_polling_fd_r in r:
                     break
-
                 if pubsub_fd in r:
                     while pubsub.get_message():
                         pass
                     self.update()
-
-                self._last_heartbeat_at = time.monotonic()
-                self.heartbeat()
 
                 now = time.monotonic()
                 if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
