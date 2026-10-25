@@ -267,8 +267,12 @@ the following:
   the channel of the ring. If no reply arrives, `start()` raises
   `redis.exceptions.TimeoutError`.
 
+  The thread checks for a request to stop at least once per second. Thus,
+  `stop()` takes up to 1 second, plus the time of the Redis calls that the
+  thread runs before the check.
+
   For the other Redis calls, `start()` and `stop()` have no timeout of their
   own. `start()` waits for the node to join the ring. `stop()` waits for the
-  Redis call that the thread runs, if any. The socket timeouts of the Redis
+  Redis calls that the thread runs, if any. The socket timeouts of the Redis
   client limit these waits. Without socket timeouts, both methods can wait
   forever if Redis does not respond.
