@@ -521,6 +521,11 @@ class RingNode(object):
 
         self._run_loop(pubsub, last_cleanup_at)
 
+    def _renew_ownership(self, heartbeat_started_at):
+        """Send a heartbeat and record when it started."""
+        self.heartbeat()
+        self._last_heartbeat_at = heartbeat_started_at
+
     def _wait_for_ring_change(self, pubsub):
         """Wait for notices, bounded by the next heartbeat and stop check."""
         next_heartbeat_at = self._last_heartbeat_at + POLL_INTERVAL_SECONDS
@@ -539,8 +544,7 @@ class RingNode(object):
             while not self._stop_requested.is_set():
                 now = time.monotonic()
                 if now - self._last_heartbeat_at >= POLL_INTERVAL_SECONDS:
-                    self.heartbeat()
-                    self._last_heartbeat_at = now
+                    self._renew_ownership(now)
                 if self._stop_requested.is_set():
                     break
 
