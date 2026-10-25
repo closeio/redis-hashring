@@ -521,6 +521,18 @@ class RingNode(object):
 
         self._run_loop(pubsub, last_cleanup_at)
 
+    def _wait_for_ring_change(self, pubsub):
+        """Wait for notices, bounded by the next heartbeat and stop check."""
+        next_heartbeat_at = self._last_heartbeat_at + POLL_INTERVAL_SECONDS
+        timeout = min(
+            STOP_CHECK_INTERVAL_SECONDS,
+            max(0.0, next_heartbeat_at - time.monotonic()),
+        )
+        if pubsub.get_message(timeout=timeout) is not None:
+            while pubsub.get_message() is not None:
+                pass
+            self.update()
+
     def _run_loop(self, pubsub, last_cleanup_at):
         """Maintain the ring until stopped."""
         try:
@@ -532,17 +544,7 @@ class RingNode(object):
                 if self._stop_requested.is_set():
                     break
 
-                next_heartbeat_at = (
-                    self._last_heartbeat_at + POLL_INTERVAL_SECONDS
-                )
-                timeout = min(
-                    STOP_CHECK_INTERVAL_SECONDS,
-                    max(0.0, next_heartbeat_at - time.monotonic()),
-                )
-                if pubsub.get_message(timeout=timeout) is not None:
-                    while pubsub.get_message() is not None:
-                        pass
-                    self.update()
+                self._wait_for_ring_change(pubsub)
                 now = time.monotonic()
                 if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
                     self.cleanup()
