@@ -820,6 +820,24 @@ def test_thread_survives_failed_heartbeat(redis):
 
 @pytest.mark.usefixtures("short_intervals")
 @patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_gives_up_keys_without_heartbeats(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        ranges = node.get_ranges()
+        heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        node.heartbeat = heartbeat
+
+        # After 0.4 s without a heartbeat, the node owns no keys.
+        wait_for(lambda: node.get_ranges() == ())
+        assert node.get_node_count() == 0
+        assert node.contains("item") is False
+
+        # When the heartbeat works again, the node gets its keys back.
+        heartbeat.heal()
+        wait_for(lambda: node.get_ranges() == ranges)
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
 def test_node_gives_up_keys_while_heartbeat_blocks(redis):
     with RingNode(redis, TEST_KEY) as node:
         ranges = node.get_ranges()
@@ -850,6 +868,77 @@ def test_node_gives_up_keys_while_heartbeat_blocks(redis):
         wait_for(lambda: node.get_ranges() == ranges)
         # The first notice came right after the heartbeat that blocked.
         assert notices[0] == 1
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_gives_up_keys_while_update_fails(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        ranges = node.get_ranges()
+        # Count the heartbeats. All of them work.
+        heartbeat = FailingCall(node.heartbeat, failures_left=0)
+        node.heartbeat = heartbeat
+        fetch_ring = FailingCall(node._fetch_ring, failures_left=math.inf)
+        node._fetch_ring = fetch_ring
+
+        # No `update` works after the heartbeats. After 0.4 s, the node owns
+        # no keys.
+        wait_for(lambda: node.get_ranges() == ())
+        # More heartbeats without a successful `update` do not give the keys
+        # back.
+        heartbeat_count = heartbeat.success_count
+        wait_for(lambda: heartbeat.success_count >= heartbeat_count + 3)
+        assert node.get_ranges() == ()
+        assert node.get_node_count() == 0
+        assert node.contains("item") is False
+
+        # When `update` works again, the node gets its keys back.
+        fetch_ring.heal()
+        wait_for(lambda: node.get_ranges() == ranges)
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_thread_resets_deadline_when_it_exits(redis):
+    node = RingNode(redis, TEST_KEY)
+    with node:
+        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        # The deadline passes, so readers see no keys.
+        wait_for(lambda: node.get_ranges() == ())
+    # Use the real `heartbeat` again.
+    del node.heartbeat
+
+    # Without the thread, no deadline applies to the state.
+    node.heartbeat()
+    node.update()
+    assert node.get_node_count() == 1
+    assert node.contains("item") is True
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_notifies_other_nodes_when_it_joins_again(redis):
+    pubsub = redis.pubsub()
+    try:
+        pubsub.subscribe(TEST_KEY)
+        assert pubsub.get_message(timeout=5)["type"] == "subscribe"
+
+        with RingNode(redis, TEST_KEY) as node:
+            heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+            node.heartbeat = heartbeat
+            wait_for(lambda: node.get_ranges() == ())
+            # Drop the notices from before the outage.
+            while pubsub.get_message() is not None:
+                pass
+
+            # No cleanup removed the replicas of the node, so the heartbeat
+            # only updates their scores. The node sends the notice itself.
+            heartbeat.heal()
+            message = pubsub.get_message(timeout=5)
+            assert message is not None
+            assert message["type"] == "message"
+    finally:
+        pubsub.close()
 
 
 @pytest.mark.usefixtures("short_intervals")
