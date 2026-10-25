@@ -280,8 +280,8 @@ the following:
 - Redis errors
 
   After `start()` returns, the node tries again after each error, until
-  `stop()`. It waits 1 second before each new attempt, returning early
-  if a stop is requested.
+  `stop()`. Before each new attempt, it waits for a random time between
+  0.5 and 1 second, returning early if a stop is requested.
 
   The node logs each failed attempt with the logger `redis_hashring`, at the
   level `WARNING`, with the traceback. Without a logging configuration,

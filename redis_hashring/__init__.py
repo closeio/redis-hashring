@@ -526,8 +526,14 @@ class RingNode(object):
         return False
 
     def _wait_before_retry(self, retry_interval):
-        """Wait before retrying, returning early if stopped."""
-        self._stop_requested.wait(retry_interval)
+        """
+        Wait before the next attempt after an error.
+
+        Wait for a random time between half `retry_interval` and the full
+        interval, so that the nodes do not all try again at the same time.
+        Return early if `self._stop_requested` is set.
+        """
+        self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
 
     def _poll(self):
         """
