@@ -1,5 +1,6 @@
 import itertools
 import logging
+import math
 import socket
 import threading
 import time
@@ -883,6 +884,34 @@ def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     assert node._last_heartbeat_at == (
         previous_heartbeat if failed_step == "_notify" else started_at
     )
+
+
+@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
+@patch.object(redis_hashring, "RETRY_INTERVAL_MIN_SECONDS", 10)
+def test_stop_while_heartbeat_fails(redis):
+    node = RingNode(redis, TEST_KEY)
+    node.start()
+    try:
+        retry_wait_started = threading.Event()
+        original_wait_before_retry = node._wait_before_retry
+
+        def wait_before_retry(retry_interval):
+            retry_wait_started.set()
+            original_wait_before_retry(retry_interval)
+
+        node._wait_before_retry = wait_before_retry
+        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        # After the first failure, the thread waits at least 5 s before it
+        # tries again.
+        assert retry_wait_started.wait(timeout=5)
+    except BaseException:
+        # Stop the thread, so that it does not affect the next tests.
+        node.stop()
+        raise
+
+    started_at = time.monotonic()
+    node.stop()
+    assert time.monotonic() - started_at < 2
 
 
 @pytest.mark.usefixtures("short_intervals")

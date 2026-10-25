@@ -525,6 +525,10 @@ class RingNode(object):
                 return True
         return False
 
+    def _wait_before_retry(self, retry_interval):
+        """Wait before retrying, returning early if stopped."""
+        self._stop_requested.wait(retry_interval)
+
     def _poll(self):
         """
         Keep the node in the ring until `stop` asks the thread to exit.
@@ -649,7 +653,7 @@ class RingNode(object):
                     )
                     _close_pubsub(pubsub)
                     pubsub = None
-                    self._stop_requested.wait(RETRY_INTERVAL_MIN_SECONDS)
+                    self._wait_before_retry(RETRY_INTERVAL_MIN_SECONDS)
         finally:
             _close_pubsub(pubsub)
             # Clear ownership before removing the deadline, so readers cannot
