@@ -495,7 +495,7 @@ class RingNode(object):
             pubsub = self._subscribe()
             pubsub_fd = pubsub.connection._sock.fileno()
 
-            last_heartbeat = time.time()
+            last_heartbeat = time.monotonic()
             # From here on, the ring can hold replicas of this node, even if
             # a call raises.
             may_be_in_ring = True
@@ -503,7 +503,7 @@ class RingNode(object):
 
             self.update()
 
-            last_cleanup = time.time()
+            last_cleanup_at = time.monotonic()
             self.cleanup()
         except BaseException as error:
             self._setup_error = error
@@ -519,16 +519,18 @@ class RingNode(object):
         finally:
             self._setup_done.set()
 
-        self._run_loop(pubsub, pubsub_fd, last_heartbeat, last_cleanup)
+        self._run_loop(pubsub, pubsub_fd, last_heartbeat, last_cleanup_at)
 
-    def _run_loop(self, pubsub, pubsub_fd, last_heartbeat, last_cleanup):
+    def _run_loop(self, pubsub, pubsub_fd, last_heartbeat, last_cleanup_at):
         """Maintain the ring until stopped."""
         try:
             while True:
                 # Since Redis' `listen` method blocks, we use `select` to
                 # inspect the underlying socket to see if there is activity.
                 timeout = max(
-                    0.0, POLL_INTERVAL_SECONDS - (time.time() - last_heartbeat)
+                    0.0,
+                    POLL_INTERVAL_SECONDS
+                    - (time.monotonic() - last_heartbeat),
                 )
                 r, _, _ = select.select(
                     [self._stop_polling_fd_r, pubsub_fd], [], [], timeout
@@ -542,13 +544,13 @@ class RingNode(object):
                         pass
                     self.update()
 
-                last_heartbeat = time.time()
+                last_heartbeat = time.monotonic()
                 self.heartbeat()
 
-                now = time.time()
-                if now - last_cleanup > CLEANUP_INTERVAL_SECONDS:
-                    last_cleanup = now
+                now = time.monotonic()
+                if now - last_cleanup_at >= CLEANUP_INTERVAL_SECONDS:
                     self.cleanup()
+                    last_cleanup_at = now
         finally:
             _close_pubsub(pubsub)
 
