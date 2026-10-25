@@ -669,6 +669,16 @@ def test_node_gives_up_keys_while_heartbeat_blocks(redis):
         ranges = node.get_ranges()
         heartbeat = BlockingCall(node.heartbeat)
         node.heartbeat = heartbeat
+        # The number of heartbeats at each notice.
+        notices = []
+        original_notify = node._notify
+
+        def notify():
+            notices.append(heartbeat.call_count)
+            original_notify()
+
+        node._notify = notify
+
         try:
             assert heartbeat.started.wait(timeout=5)
             # The thread waits in `heartbeat`. After the deadline of 0.4 s,
@@ -679,7 +689,11 @@ def test_node_gives_up_keys_while_heartbeat_blocks(redis):
         finally:
             heartbeat.release.set()
 
+        # The heartbeat ends after the deadline, so the node notifies the
+        # other nodes right after it. Then the node gets its keys back.
         wait_for(lambda: node.get_ranges() == ranges)
+        # The first notice came right after the heartbeat that blocked.
+        assert notices[0] == 1
 
 
 @patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
@@ -691,7 +705,8 @@ def test_node_reads_ring_after_each_heartbeat(redis):
         wait_for(lambda: node.get_node_count() == 2)
 
 
-def test_failed_renewal_preserves_ownership_deadline(redis):
+@pytest.mark.parametrize("failed_step", ["_notify", "update"])
+def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     node = RingNode(redis, TEST_KEY)
     node.heartbeat()
     node.update()
@@ -705,11 +720,13 @@ def test_failed_renewal_preserves_ownership_deadline(redis):
     assert node.get_ranges() == ()
 
     with patch.object(
-        node, "update", side_effect=RedisConnectionError("renewal failed")
+        node, failed_step, side_effect=RedisConnectionError("renewal failed")
     ):
         with pytest.raises(RedisConnectionError, match="^renewal failed$"):
             node._renew_ownership(started_at)
 
     assert node._ownership_valid_until == previous_deadline
     assert node.get_ranges() == ()
-    assert node._last_heartbeat_at == started_at
+    assert node._last_heartbeat_at == (
+        previous_heartbeat if failed_step == "_notify" else started_at
+    )

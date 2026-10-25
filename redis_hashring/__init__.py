@@ -575,13 +575,18 @@ class RingNode(object):
         """
         Renew membership and ownership, in that order.
 
-        A failed ring read keeps the new heartbeat timestamp but does not
-        extend ownership validity.
+        A failed notice leaves the heartbeat timestamp unchanged, so the
+        next attempt sends the notice again. A failed ring read keeps the
+        new heartbeat timestamp but does not extend ownership validity.
         """
+        previous_deadline = _deadline_after(self._last_heartbeat_at)
         self.heartbeat()
         if self._stop_requested.is_set():
             return
 
+        # Peers may have taken over after the previous heartbeat expired.
+        if time.monotonic() >= previous_deadline:
+            self._notify()
         self._last_heartbeat_at = heartbeat_started_at
 
         # Refresh even without a notice: a lost pub/sub connection can miss
