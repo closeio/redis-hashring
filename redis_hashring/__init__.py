@@ -355,19 +355,33 @@ class RingNode(object):
         """
         self._conn.publish(self._key, "*")
 
-    def _subscribe(self, pubsub):
-        """Subscribe and wait for Redis to confirm the subscription."""
-        pubsub.subscribe(self._key)
-        # Wait for the reply to the subscription before `update`. After
-        # the reply, Redis sends each change of the ring to this
-        # connection, so no change after `update` gets lost. Wait with a
-        # limit of our own, so that the setup ends even if Redis does not
-        # reply.
-        if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
-            raise RedisTimeoutError(
-                f"No reply to the subscription to {self._key!r}"
-                f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
-            )
+    def _subscribe(self):
+        """
+        Return a new pub/sub object, subscribed to the ring's activity channel.
+
+        Return after Redis confirms the subscription. After that, Redis sends
+        each notice on the channel to the pub/sub object. If no confirmation
+        arrives in `SUBSCRIBE_TIMEOUT_SECONDS` seconds, raise
+        `redis.exceptions.TimeoutError`.
+
+        If a step fails, close the pub/sub object before the error goes up.
+        """
+        # Keep subscribe messages, so that `get_message` returns the reply to
+        # the subscription.
+        pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
+        try:
+            pubsub.subscribe(self._key)
+            # Wait with a limit of our own, so that the call ends even if
+            # Redis does not reply.
+            if pubsub.get_message(timeout=SUBSCRIBE_TIMEOUT_SECONDS) is None:
+                raise RedisTimeoutError(
+                    f"No reply to the subscription to {self._key!r}"
+                    f" after {SUBSCRIBE_TIMEOUT_SECONDS} s."
+                )
+        except BaseException:
+            _close_pubsub(pubsub)
+            raise
+        return pubsub
 
     def cleanup(self):
         """
@@ -476,10 +490,9 @@ class RingNode(object):
         try:
             self._stop_polling_fd_r, self._stop_polling_fd_w = os.pipe()
 
-            # Keep subscribe messages, so that `get_message` returns the reply
-            # to the subscription.
-            pubsub = self._conn.pubsub(ignore_subscribe_messages=False)
-            self._subscribe(pubsub)
+            # Subscribe before `update`, so that no change of the ring after
+            # `update` gets lost.
+            pubsub = self._subscribe()
             pubsub_fd = pubsub.connection._sock.fileno()
 
             last_heartbeat = time.time()
