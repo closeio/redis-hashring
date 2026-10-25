@@ -546,7 +546,7 @@ class RingNode(object):
                     last_cleanup = now
                     self.cleanup()
         finally:
-            pubsub.close()
+            _close_pubsub(pubsub)
 
     def _close_stop_pipe(self):
         """
