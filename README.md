@@ -310,9 +310,13 @@ the following:
   notifies the other nodes after the next heartbeat. Then they read the ring
   and give the keys back.
 
-  The node logs one record at the level `ERROR` when a renewal observes
-  that its ownership deadline has passed, including the delay since
-  expiry, and one at the level `INFO` when validity is restored. It
-  checks before and after a renewal advances the deadline. If Redis
-  blocks, logging waits for the call to return; ownership checks still
-  enforce the deadline while the thread is blocked.
+  The node logs one record at the level `ERROR` when it observes that its
+  ownership deadline has passed, and one at the level `INFO` when a renewal
+  restores ownership validity. Failed attempts continue to log at `WARNING`.
+  The expiry record includes the delay since the deadline, and the traceback
+  if it is observed while handling a failed attempt.
+
+  These observations happen after failed attempts and retry waits, and
+  before and after a renewal advances the deadline. If a Redis call blocks,
+  logging waits for the call to return; the ownership checks still enforce
+  the deadline while the thread is blocked.

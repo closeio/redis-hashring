@@ -899,6 +899,33 @@ def test_node_gives_up_keys_while_update_fails(redis):
 
 @pytest.mark.usefixtures("short_intervals")
 @patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_logs_ownership_loss_and_recovery_once(redis, caplog):
+    caplog.set_level(logging.INFO, logger="redis_hashring")
+    with RingNode(redis, TEST_KEY, n_replicas=1) as node:
+        heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
+        node.heartbeat = heartbeat
+        wait_for(lambda: log_records(caplog, logging.ERROR))
+        assert node.get_ranges() == ()
+        failure_count = heartbeat.failure_count
+        wait_for(lambda: heartbeat.failure_count >= failure_count + 3)
+
+        heartbeat.heal()
+        wait_for(lambda: log_records(caplog, logging.INFO))
+        assert node.get_ranges() == ((0, RING_SIZE),)
+
+    levels = [record.levelno for record in log_records(caplog)]
+    assert levels.count(logging.ERROR) == 1
+    assert levels.count(logging.INFO) == 1
+    assert levels[-1] == logging.INFO
+    (error_record,) = log_records(caplog, logging.ERROR)
+    assert error_record.exc_info[0] is RedisConnectionError
+    assert TEST_KEY in error_record.getMessage()
+    (info_record,) = log_records(caplog, logging.INFO)
+    assert TEST_KEY in info_record.getMessage()
+
+
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
 def test_node_logs_expiry_after_blocked_heartbeat(redis, caplog):
     caplog.set_level(logging.INFO, logger="redis_hashring")
     with RingNode(redis, TEST_KEY) as node:
@@ -917,6 +944,27 @@ def test_node_logs_expiry_after_blocked_heartbeat(redis, caplog):
     assert error_record.levelno == logging.ERROR
     assert error_record.args[1] >= 0.2
     assert error_record.exc_info is None
+    assert info_record.levelno == logging.INFO
+
+
+@patch.multiple(
+    redis_hashring,
+    POLL_INTERVAL_SECONDS=0.1,
+    NODE_TIMEOUT_SECONDS=0.5,
+    RETRY_INTERVAL_MIN_SECONDS=1,
+    RETRY_INTERVAL_MAX_SECONDS=1,
+)
+def test_node_logs_expiry_during_retry_wait(redis, caplog):
+    caplog.set_level(logging.INFO, logger="redis_hashring")
+    with RingNode(redis, TEST_KEY) as node:
+        heartbeat = FailingCall(node.heartbeat, failures_left=1)
+        node.heartbeat = heartbeat
+        wait_for(lambda: log_records(caplog, logging.INFO))
+
+    warning_record, error_record, info_record = log_records(caplog)
+    assert warning_record.levelno == logging.WARNING
+    assert error_record.levelno == logging.ERROR
+    assert error_record.exc_info[0] is RedisConnectionError
     assert info_record.levelno == logging.INFO
 
 

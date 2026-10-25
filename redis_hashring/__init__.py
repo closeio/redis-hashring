@@ -693,9 +693,11 @@ class RingNode(object):
                         self._key,
                         exc_info=True,
                     )
+                    self._log_ownership_change(exc_info=True)
                     _close_pubsub(pubsub)
                     pubsub = None
                     self._wait_before_retry(retry_interval)
+                    self._log_ownership_change(exc_info=True)
                     retry_interval = min(
                         retry_interval * 2, RETRY_INTERVAL_MAX_SECONDS
                     )
