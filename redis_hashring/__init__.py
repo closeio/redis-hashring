@@ -220,7 +220,7 @@ class RingNode(object):
         self._removal_count = 0
         # Heartbeats can succeed while ring reads fail. Only a complete
         # renewal extends ownership validity. The polling thread writes both
-        # timestamps.
+        # timestamps; readers only check `_ownership_valid_until`.
         self._last_heartbeat_at = 0.0
         # The deadline: the `time.monotonic` value after which readers see an
         # empty state. Readers compare it with the time at each call, so no
@@ -467,7 +467,9 @@ class RingNode(object):
             self._state = _EMPTY_STATE
 
     def _read_state(self):
-        """Return the current ownership snapshot."""
+        """Return ownership only while its renewal is still valid."""
+        if time.monotonic() >= self._ownership_valid_until:
+            return _EMPTY_STATE
         return self._state
 
     def get_ranges(self):
@@ -476,18 +478,30 @@ class RingNode(object):
 
         Each range is a tuple (a, b) that includes any ring point N with
         a <= N < b.
+
+        While the node runs, return an empty tuple after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
         return self._read_state().ranges
 
     def get_node_count(self):
         """
         Return the number of active nodes in the ring.
+
+        While the node runs, return 0 after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
         return self._read_state().node_count
 
     def contains(self, key):
         """
         Check whether this node is responsible for the item.
+
+        While the node runs, return `False` after
+        `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
+        heartbeat and a successful `update` after it.
         """
         return self._contains_ring_point(self.key_as_ring_point(key))
 
@@ -536,7 +550,8 @@ class RingNode(object):
             last_cleanup_at = time.monotonic()
             self.cleanup()
 
-            # The setup worked. Record the deadline of the last heartbeat.
+            # The setup worked. From now on, readers see the state only until
+            # the deadline of the last heartbeat.
             self._ownership_valid_until = _deadline_after(
                 self._last_heartbeat_at
             )

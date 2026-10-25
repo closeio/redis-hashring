@@ -281,3 +281,16 @@ the following:
   The node reads the ring after each heartbeat, every 10 seconds. Thus, if the
   node misses a notice of a change of the ring, it sees the change within 10
   seconds.
+
+  If the node cannot send a heartbeat and then read the ring for 50 seconds,
+  it gives up its keys. Then `contains()` returns `False` for all keys,
+  `get_ranges()` returns an empty tuple, and `get_node_count()` returns 0.
+  The other nodes see the node as dead after 60 seconds, so the node gives up
+  its keys first. Each heartbeat stores the time on the clock of the node, and
+  the other nodes compare it with their own clocks. Thus, the node gives up its
+  keys first only if the clocks of the hosts differ by less than 10 seconds. If
+  the clocks differ by more, two nodes can own the same keys at the same time.
+
+  These three methods compare the current time with the 50-second deadline
+  at each call. Thus, the node gives up its keys on time, even if a Redis call
+  of the thread blocks.

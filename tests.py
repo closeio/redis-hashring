@@ -640,6 +640,48 @@ def wait_for(condition, timeout=5):
         time.sleep(0.01)
 
 
+class BlockingCall:
+    """
+    A stand-in for a method of `RingNode`.
+
+    The first call sets `started`, waits for `release`, and then runs the
+    real method. Each later call runs the real method at once.
+    """
+
+    def __init__(self, method):
+        self.method = method
+        self.call_count = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self):
+        self.call_count += 1
+        if self.call_count == 1:
+            self.started.set()
+            self.release.wait()
+        return self.method()
+
+
+@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+def test_node_gives_up_keys_while_heartbeat_blocks(redis):
+    with RingNode(redis, TEST_KEY) as node:
+        ranges = node.get_ranges()
+        heartbeat = BlockingCall(node.heartbeat)
+        node.heartbeat = heartbeat
+        try:
+            assert heartbeat.started.wait(timeout=5)
+            # The thread waits in `heartbeat`. After the deadline of 0.4 s,
+            # readers see no keys.
+            wait_for(lambda: node.get_ranges() == ())
+            assert node.get_node_count() == 0
+            assert node.contains("item") is False
+        finally:
+            heartbeat.release.set()
+
+        wait_for(lambda: node.get_ranges() == ranges)
+
+
 @patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
 def test_node_reads_ring_after_each_heartbeat(redis):
     with RingNode(redis, TEST_KEY) as node:
@@ -647,3 +689,27 @@ def test_node_reads_ring_after_each_heartbeat(redis):
         redis.zadd(TEST_KEY, {f"0:{OTHER_REPLICA}": time.time()})
 
         wait_for(lambda: node.get_node_count() == 2)
+
+
+def test_failed_renewal_preserves_ownership_deadline(redis):
+    node = RingNode(redis, TEST_KEY)
+    node.heartbeat()
+    node.update()
+    started_at = time.monotonic()
+    previous_heartbeat = started_at - redis_hashring.NODE_TIMEOUT_SECONDS
+    node._last_heartbeat_at = previous_heartbeat
+    node._ownership_valid_until = redis_hashring._deadline_after(
+        previous_heartbeat
+    )
+    previous_deadline = node._ownership_valid_until
+    assert node.get_ranges() == ()
+
+    with patch.object(
+        node, "update", side_effect=RedisConnectionError("renewal failed")
+    ):
+        with pytest.raises(RedisConnectionError, match="^renewal failed$"):
+            node._renew_ownership(started_at)
+
+    assert node._ownership_valid_until == previous_deadline
+    assert node.get_ranges() == ()
+    assert node._last_heartbeat_at == started_at
