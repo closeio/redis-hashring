@@ -549,20 +549,22 @@ class RingNode(object):
             return
         self._reported_ownership_expired = expired
 
-        if expired:
-            _logger.error(
-                "The node in the ring %r gave up its keys %.1f seconds"
-                " ago, after %s seconds without a successful heartbeat"
-                " and read of the ring.",
-                self._key,
-                now - self._ownership_valid_until,
-                NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS,
-                exc_info=exc_info,
-            )
-        else:
-            _logger.info(
-                "The node in the ring %r got its keys back.", self._key
-            )
+        # Application log handlers must not interrupt membership maintenance.
+        with contextlib.suppress(Exception):
+            if expired:
+                _logger.error(
+                    "The node in the ring %r gave up its keys %.1f seconds"
+                    " ago, after %s seconds without a successful heartbeat"
+                    " and read of the ring.",
+                    self._key,
+                    now - self._ownership_valid_until,
+                    NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS,
+                    exc_info=exc_info,
+                )
+            else:
+                _logger.info(
+                    "The node in the ring %r got its keys back.", self._key
+                )
 
     def _poll(self):
         """
@@ -687,12 +689,13 @@ class RingNode(object):
 
                     retry_interval = RETRY_INTERVAL_MIN_SECONDS
                 except Exception:
-                    _logger.warning(
-                        "An attempt of the node in the ring %r failed."
-                        " The node will try again.",
-                        self._key,
-                        exc_info=True,
-                    )
+                    with contextlib.suppress(Exception):
+                        _logger.warning(
+                            "An attempt of the node in the ring %r failed."
+                            " The node will try again.",
+                            self._key,
+                            exc_info=True,
+                        )
                     self._log_ownership_change(exc_info=True)
                     _close_pubsub(pubsub)
                     pubsub = None

@@ -319,4 +319,5 @@ the following:
   These observations happen after failed attempts and retry waits, and
   before and after a renewal advances the deadline. If a Redis call blocks,
   logging waits for the call to return; the ownership checks still enforce
-  the deadline while the thread is blocked.
+  the deadline while the thread is blocked. Errors in application log
+  handlers do not stop the node.

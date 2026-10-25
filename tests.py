@@ -758,6 +758,45 @@ def test_thread_logs_errors(redis, caplog):
     excepthook.assert_not_called()
 
 
+@pytest.mark.usefixtures("short_intervals")
+@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
+@pytest.mark.parametrize("expire_ownership", [False, True])
+def test_thread_survives_failed_log_handler(redis, caplog, expire_ownership):
+    caplog.set_level(logging.INFO, logger="redis_hashring")
+    logger = logging.getLogger("redis_hashring")
+    handler = logging.StreamHandler()
+    logger.addHandler(handler)
+    try:
+        with patch.object(
+            handler, "emit", side_effect=RuntimeError("broken log handler")
+        ) as emit:
+            with RingNode(redis, TEST_KEY, n_replicas=1) as node:
+                heartbeat = FailingCall(
+                    node.heartbeat,
+                    failures_left=math.inf if expire_ownership else 1,
+                )
+                node.heartbeat = heartbeat
+                if expire_ownership:
+                    wait_for(
+                        lambda: any(
+                            call.args[0].levelno == logging.ERROR
+                            for call in emit.call_args_list
+                        )
+                    )
+                    heartbeat.heal()
+                wait_for(lambda: heartbeat.success_count > 0)
+                wait_for(lambda: node.get_ranges() == ((0, RING_SIZE),))
+                assert node._polling_thread.is_alive()
+        levels = [call.args[0].levelno for call in emit.call_args_list]
+        if expire_ownership:
+            assert levels.count(logging.ERROR) == 1
+            assert levels.count(logging.INFO) == 1
+        else:
+            assert levels == [logging.WARNING]
+    finally:
+        logger.removeHandler(handler)
+
+
 # Keep the default `POLL_INTERVAL_SECONDS`, so that no heartbeat makes the
 # node read the ring during the test.
 @patch.multiple(
