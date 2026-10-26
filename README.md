@@ -308,6 +308,13 @@ the following:
   at each call. Thus, the node gives up its keys on time, even if a Redis call
   of the thread blocks.
 
+  After a failed read of the ring, the node sends no heartbeat until a read
+  works again. Otherwise, the heartbeats keep the node alive for the other
+  nodes, and no node owns its keys. Thus, if the node can send heartbeats but
+  cannot read the ring, the other nodes see it as dead 60 seconds after its
+  last heartbeat. They take over its keys at their next read of the ring,
+  within 10 more seconds.
+
   When Redis is available again, the node joins the ring again and gets its
   keys back. If the node had no successful heartbeat for 50 seconds, it
   notifies the other nodes after the next heartbeat. Then they read the ring

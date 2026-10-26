@@ -944,13 +944,15 @@ def test_node_gives_up_keys_while_update_fails(redis):
         # No `update` works after the heartbeats. After 0.4 s, the node owns
         # no keys.
         wait_for(lambda: node.get_ranges() == ())
-        # More heartbeats without a successful `update` do not give the keys
-        # back.
-        heartbeat_count = heartbeat.success_count
-        wait_for(lambda: heartbeat.success_count >= heartbeat_count + 3)
-        assert node.get_ranges() == ()
         assert node.get_node_count() == 0
         assert node.contains("item") is False
+        # While the ring reads fail, the node sends no heartbeats. Thus, the
+        # other nodes can see it as dead, and take over its keys.
+        heartbeat_count = heartbeat.success_count
+        failure_count = fetch_ring.failure_count
+        wait_for(lambda: fetch_ring.failure_count >= failure_count + 3)
+        assert heartbeat.success_count == heartbeat_count
+        assert node.get_ranges() == ()
 
         # When `update` works again, the node gets its keys back.
         fetch_ring.heal()
@@ -1084,7 +1086,10 @@ def test_node_reads_ring_after_each_heartbeat(redis):
 @pytest.mark.usefixtures("short_intervals")
 @patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
 @pytest.mark.parametrize("clean_up_expired_node", [False, True])
-def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
+@pytest.mark.parametrize("failed_call", ["heartbeat", "_fetch_ring"])
+def test_two_nodes_handoff_and_recover(
+    redis, clean_up_expired_node, failed_call
+):
     quarter = RING_SIZE // 4
     with patch.object(socket, "gethostname", return_value="host1"):
         node1 = RingNode(redis, TEST_KEY, n_replicas=1)
@@ -1100,12 +1105,16 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
         assert node2.get_ranges() == ranges2
         assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
 
-        heartbeat = FailingCall(node1.heartbeat, failures_left=math.inf)
-        node1.heartbeat = heartbeat
+        failing_call = FailingCall(
+            getattr(node1, failed_call), failures_left=math.inf
+        )
+        setattr(node1, failed_call, failing_call)
         wait_for(lambda: node1.get_ranges() == ())
         assert node1.get_node_count() == 0
         assert node1.contains("item") is False
 
+        # Node 2 takes over the keys of node 1, even if node 1 can send
+        # heartbeats but cannot read the ring.
         wait_for(lambda: node2.get_ranges() == ((0, RING_SIZE),))
         assert node2.get_node_count() == 1
         assert node1.get_ranges() == ()
@@ -1115,7 +1124,7 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
             node2.cleanup()
             assert redis.zcard(TEST_KEY) == 1
 
-        heartbeat.heal()
+        failing_call.heal()
         wait_for(
             lambda: node1.get_ranges() == ranges1
             and node2.get_ranges() == ranges2
@@ -1242,8 +1251,8 @@ def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     update = FailingCall(node.update, failures_left=1)
     try:
         node.heartbeat = heartbeat
-        # The failed update makes the thread subscribe again, and then send a
-        # heartbeat.
+        # The failed update makes the thread subscribe again, read the ring,
+        # and then send a heartbeat.
         node.update = update
         redis.publish(TEST_KEY, "*")
         assert heartbeat.started.wait(timeout=5)
@@ -1259,8 +1268,9 @@ def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     finally:
         heartbeat.release.set()
 
-    # The thread exits after the heartbeat, before the update and the wait
-    # for a notice.
+    # The last update failed, so the thread runs one update before the
+    # heartbeat. The thread exits after the heartbeat, before the next update
+    # and the wait for a notice.
     join_thread(stop_thread)
     assert update.failure_count == 1
-    assert update.success_count == 0
+    assert update.success_count == 1

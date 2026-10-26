@@ -241,6 +241,8 @@ class RingNode(object):
         # empty state. Readers compare it with the time at each call, so no
         # Redis call can delay the deadline.
         self._ownership_valid_until = math.inf
+        # Whether the last ring read of the polling thread failed.
+        self._ring_read_failed = False
         # Logging state, observed only by the polling thread.
         self._reported_ownership_expired = False
 
@@ -545,6 +547,11 @@ class RingNode(object):
         """
         self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
 
+    def _update_and_track_failure(self):
+        self._ring_read_failed = True
+        self.update()
+        self._ring_read_failed = False
+
     def _log_ownership_change(self, *, exc_info=None):
         """Report each expiry and recovery once, when the thread observes it."""
         now = time.monotonic()
@@ -597,7 +604,7 @@ class RingNode(object):
             self._last_heartbeat_at = time.monotonic()
             self.heartbeat()
 
-            self.update()
+            self._update_and_track_failure()
 
             last_cleanup_at = time.monotonic()
             self.cleanup()
@@ -628,10 +635,21 @@ class RingNode(object):
         """
         Renew membership and ownership, in that order.
 
+        If the last ring read failed, read the ring before the heartbeat. If
+        this read also fails, send no heartbeat. Without this check, the
+        heartbeats keep this node alive for the other nodes after its
+        ownership expires. Then no node owns the keys of this node.
+
         A failed notice leaves the heartbeat timestamp unchanged, so the
-        next attempt sends the notice again. A failed ring read keeps the
-        new heartbeat timestamp but does not extend ownership validity.
+        next attempt sends the notice again. A failed ring read after the
+        heartbeat keeps the new heartbeat timestamp but does not extend
+        ownership validity.
         """
+        if self._ring_read_failed:
+            self._update_and_track_failure()
+            if self._stop_requested.is_set():
+                return
+
         previous_deadline = _deadline_after(self._last_heartbeat_at)
         self.heartbeat()
         if self._stop_requested.is_set():
@@ -644,7 +662,7 @@ class RingNode(object):
 
         # Refresh even without a notice: a lost pub/sub connection can miss
         # changes. Publish the new ranges before extending their validity.
-        self.update()
+        self._update_and_track_failure()
         # A blocking Redis call may have let ownership expire without an
         # exception. Observe that transition before advancing the deadline.
         self._log_ownership_change()
@@ -661,7 +679,7 @@ class RingNode(object):
         if pubsub.get_message(timeout=timeout) is not None:
             while pubsub.get_message() is not None:
                 pass
-            self.update()
+            self._update_and_track_failure()
 
     def _run_loop(self, pubsub, last_cleanup_at):
         """Maintain the ring, retrying failed attempts until stopped."""
