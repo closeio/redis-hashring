@@ -99,6 +99,27 @@ def test_contains(redis, hash_algorithm):
     assert node1.contains("item") is False
 
 
+@pytest.mark.parametrize(
+    "hash_algorithm, point",
+    [
+        (HashAlgorithm.CRC32, 907_060_870),
+        (HashAlgorithm.XXHASH, 4_211_111_929),
+    ],
+)
+def test_ring_point(redis, hash_algorithm, point):
+    # The points must stay the same across releases, so that all nodes of a
+    # ring agree on them.
+    assert hash_algorithm.ring_point("hello") == point
+    node = RingNode(redis, TEST_KEY, hash_algorithm=hash_algorithm)
+    assert node.key_as_ring_point("hello") == point
+
+
+def test_ring_point_without_xxhash():
+    with patch("redis_hashring.xxhash", None):
+        with pytest.raises(ImportError):
+            HashAlgorithm.XXHASH.ring_point("hello")
+
+
 def find_key(node, start, end):
     """
     Return a key whose ring point is in the range [start, end).

@@ -28,6 +28,15 @@ class HashAlgorithm(enum.Enum):
     CRC32 = "crc32"
     XXHASH = "xxhash"
 
+    def ring_point(self, key):
+        """
+        Turn a key into a point on a hash ring.
+        """
+        if self is HashAlgorithm.XXHASH:
+            _check_xxhash_installed()
+            return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
+        return binascii.crc32(key.encode()) % RING_SIZE
+
 
 # How often to update a node's heartbeat.
 POLL_INTERVAL_SECONDS = 10
@@ -50,12 +59,12 @@ _RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
 _EMPTY_STATE = _RingState(ranges=(), node_count=0)
 
 
-def _hash_with_xxhash(key):
-    return xxhash.xxh32(key.encode()).intdigest() % RING_SIZE
-
-
-def _hash_with_crc32(key):
-    return binascii.crc32(key.encode()) % RING_SIZE
+def _check_xxhash_installed():
+    if xxhash is None:
+        raise ImportError(
+            "xxhash library is required for XXHASH algorithm. "
+            "Install with: pip install redis-hashring[xxhash]"
+        )
 
 
 def _decode(data):
@@ -157,16 +166,11 @@ class RingNode(object):
         self._key = key
 
         if hash_algorithm is HashAlgorithm.XXHASH:
-            if xxhash is None:
-                raise ImportError(
-                    "xxhash library is required for XXHASH algorithm. "
-                    "Install with: pip install redis-hashring[xxhash]"
-                )
-            self._hash_function = _hash_with_xxhash
-        elif hash_algorithm is HashAlgorithm.CRC32:
-            self._hash_function = _hash_with_crc32
-        else:
+            # Fail now rather than when the node hashes its first key.
+            _check_xxhash_installed()
+        elif hash_algorithm is not HashAlgorithm.CRC32:
             raise ValueError("Unexpected hash algorithm requested")
+        self._hash_algorithm = hash_algorithm
 
         host = socket.gethostname()
         pid = os.getpid()
@@ -422,7 +426,7 @@ class RingNode(object):
 
     def key_as_ring_point(self, key):
         """Turn a key into a point on a hash ring."""
-        return self._hash_function(key)
+        return self._hash_algorithm.ring_point(key)
 
     def _contains_ring_point(self, n):
         """
