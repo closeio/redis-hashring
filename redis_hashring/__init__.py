@@ -56,9 +56,9 @@ RETRY_INTERVAL_MAX_SECONDS = POLL_INTERVAL_SECONDS
 # * ranges: tuple of the ranges that the node owns, where a range (a, b)
 #   includes any N matching a <= N < b.
 # * node_count: number of nodes currently active in the ring.
-_RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
+RingState = collections.namedtuple("_RingState", ["ranges", "node_count"])
 
-_EMPTY_STATE = _RingState(ranges=(), node_count=0)
+EMPTY_RING_STATE = RingState(ranges=(), node_count=0)
 
 # Applications can configure this logger without changing thread error hooks.
 _logger = logging.getLogger("redis_hashring")
@@ -222,7 +222,7 @@ class RingNode(object):
         # Readers take no lock, and read the state once per call, through
         # `_read_state`. Writers replace the whole state with one assignment,
         # so a reader never sees a partial state.
-        self._state = _EMPTY_STATE
+        self._state = EMPTY_RING_STATE
         # Makes sure that `update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
         # `remove` can call `remove` again, and this lock does not block it.
@@ -367,7 +367,7 @@ class RingNode(object):
         with self._state_lock:
             self._removal_count += 1
             # Own no keys from now on, even if the ZREM fails.
-            self._state = _EMPTY_STATE
+            self._state = EMPTY_RING_STATE
 
             try:
                 pipeline = self._conn.pipeline()
@@ -379,7 +379,7 @@ class RingNode(object):
                 # A signal handler on the main thread can call `update` during
                 # the ZREM, and publish the ranges of a ring that still has
                 # this node. Then clear the state again.
-                self._state = _EMPTY_STATE
+                self._state = EMPTY_RING_STATE
 
         self._notify()
 
@@ -443,7 +443,7 @@ class RingNode(object):
                 # The signal handler can also run between the check and the
                 # assignment. Then clear the state again.
                 if self._removal_count != removal_count:
-                    self._state = _EMPTY_STATE
+                    self._state = EMPTY_RING_STATE
 
     def _compute_state(self, ring):
         """
@@ -470,19 +470,19 @@ class RingNode(object):
                 else:
                     ranges.append((0, RING_SIZE))
 
-        return _RingState(ranges=tuple(ranges), node_count=len(nodes))
+        return RingState(ranges=tuple(ranges), node_count=len(nodes))
 
     def _clear_state(self):
         """
         Make sure that this node owns no keys.
         """
         with self._state_lock:
-            self._state = _EMPTY_STATE
+            self._state = EMPTY_RING_STATE
 
     def _read_state(self):
         """Return ownership only while its renewal is still valid."""
         if time.monotonic() >= self._ownership_valid_until:
-            return _EMPTY_STATE
+            return EMPTY_RING_STATE
         return self._state
 
     def get_ranges(self):
