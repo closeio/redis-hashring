@@ -1,10 +1,8 @@
 import itertools
-import logging
-import math
+import os
 import socket
 import threading
-import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 from redis import Redis
@@ -14,7 +12,6 @@ from redis.exceptions import (
     TimeoutError as RedisTimeoutError,
 )
 
-import redis_hashring
 from redis_hashring import (
     RING_SIZE,
     SUBSCRIBE_TIMEOUT_SECONDS,
@@ -24,26 +21,14 @@ from redis_hashring import (
 
 TEST_KEY = "hashring-test"
 
-# The name of the Redis connections of the tests.
-TEST_CLIENT_NAME = "hashring-test"
-
 OTHER_REPLICA = "host2:1:00000000"
 
 
 @pytest.fixture
 def redis():
-    redis = Redis(client_name=TEST_CLIENT_NAME)
+    redis = Redis()
     yield redis
     redis.delete(TEST_KEY)
-
-
-@pytest.fixture(autouse=True)
-def short_stop_check_interval():
-    """
-    Make the thread check for a request to stop every 0.05 s.
-    """
-    with patch.object(redis_hashring, "STOP_CHECK_INTERVAL_SECONDS", 0.05):
-        yield
 
 
 def get_node(redis, n_replicas, total_replicas, hash_algorithm):
@@ -548,6 +533,8 @@ def test_start_after_stop(redis):
     with node:
         first_polling_thread = node._polling_thread
     assert not first_polling_thread.is_alive()
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None
 
     with node:
         assert node.get_node_count() == 1
@@ -572,6 +559,8 @@ def test_start_raises_when_setup_fails(redis):
     close.assert_called_once()
     assert set(threading.enumerate()) <= threads_before
     assert node._polling_thread is None
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None
     assert node._setup_error is None
     # No thread runs, so `stop` does not wait.
     join_thread(start_thread(node.stop))
@@ -654,613 +643,35 @@ def test_start_raises_setup_error_when_remove_fails(redis):
     assert exc_info.value is error
 
 
-def wait_for(condition, timeout=5):
-    """
-    Wait until `condition()` returns a true value. Fail after `timeout`
-    seconds.
-    """
-    deadline = time.monotonic() + timeout
-    while not condition():
-        if time.monotonic() >= deadline:
-            pytest.fail(f"The condition is still false after {timeout} s.")
-        time.sleep(0.01)
-
-
-class FailingCall:
-    """
-    A stand-in for a method of `RingNode`.
-
-    While `failures_left` is above zero, each call decrements it, and raises
-    `redis.exceptions.ConnectionError`. After that, each call runs the real
-    method.
-    """
-
-    def __init__(self, method, failures_left):
-        self.method = method
-        self.failures_left = failures_left
-        self.failure_count = 0
-        self.success_count = 0
-        # The thread of the node decrements `failures_left`, and the test
-        # calls `heal`. The lock makes sure that no write gets lost.
-        self.lock = threading.Lock()
-
-    def __call__(self):
-        with self.lock:
-            fails = self.failures_left > 0
-            if fails:
-                self.failures_left -= 1
-        if fails:
-            self.failure_count += 1
-            raise RedisConnectionError()
-        result = self.method()
-        self.success_count += 1
-        return result
-
-    def heal(self):
-        """
-        Make each later call run the real method.
-
-        A call that already started to fail still fails.
-        """
-        with self.lock:
-            self.failures_left = 0
-
-
-class BlockingCall:
-    """
-    A stand-in for a method of `RingNode`.
-
-    The first call sets `started`, waits for `release`, and then runs the
-    real method. Each later call runs the real method at once.
-    """
-
-    def __init__(self, method):
-        self.method = method
-        self.call_count = 0
-        self.started = threading.Event()
-        self.release = threading.Event()
-
-    def __call__(self):
-        self.call_count += 1
-        if self.call_count == 1:
-            self.started.set()
-            self.release.wait()
-        return self.method()
-
-
-def get_pubsub_client_ids(redis):
-    """
-    Return the IDs of the pub/sub connections that the tests opened.
-    """
-    return {
-        client["id"]
-        for client in redis.client_list(_type="pubsub")
-        if client["name"] == TEST_CLIENT_NAME
-    }
-
-
-@pytest.fixture
-def short_intervals():
-    """
-    Make the thread send a heartbeat every 0.1 s, and try again at most 0.1 s
-    after each error.
-    """
-    with patch.multiple(
-        redis_hashring,
-        POLL_INTERVAL_SECONDS=0.1,
-        RETRY_INTERVAL_MIN_SECONDS=0.1,
-        RETRY_INTERVAL_MAX_SECONDS=0.1,
-    ):
-        yield
-
-
-def log_records(caplog, level=None):
-    return [
-        record
-        for record in caplog.records
-        if record.name == "redis_hashring"
-        and (level is None or record.levelno == level)
-    ]
-
-
-@pytest.mark.usefixtures("short_intervals")
-def test_thread_logs_errors(redis, caplog):
-    with patch.object(threading, "excepthook") as excepthook:
-        with RingNode(redis, TEST_KEY) as node:
-            heartbeat = FailingCall(node.heartbeat, failures_left=1)
-            node.heartbeat = heartbeat
-            wait_for(lambda: heartbeat.success_count > 0)
-
-    (record,) = log_records(caplog)
-    assert record.levelno == logging.WARNING
-    assert TEST_KEY in record.getMessage()
-    assert record.exc_info[0] is RedisConnectionError
-    assert record.threadName == f"redis-hashring-{TEST_KEY}"
-    excepthook.assert_not_called()
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-@pytest.mark.parametrize("expire_ownership", [False, True])
-def test_thread_survives_failed_log_handler(redis, caplog, expire_ownership):
-    caplog.set_level(logging.INFO, logger="redis_hashring")
-    logger = logging.getLogger("redis_hashring")
-    handler = logging.StreamHandler()
-    logger.addHandler(handler)
+# The thread of the node ends with an error. pytest warns about each error
+# that ends a thread.
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+def test_stop_closes_pipe_of_dead_thread(redis):
+    node = RingNode(redis, TEST_KEY)
+    node.start()
     try:
         with patch.object(
-            handler, "emit", side_effect=RuntimeError("broken log handler")
-        ) as emit:
-            with RingNode(redis, TEST_KEY, n_replicas=1) as node:
-                heartbeat = FailingCall(
-                    node.heartbeat,
-                    failures_left=math.inf if expire_ownership else 1,
-                )
-                node.heartbeat = heartbeat
-                if expire_ownership:
-                    wait_for(
-                        lambda: any(
-                            call.args[0].levelno == logging.ERROR
-                            for call in emit.call_args_list
-                        )
-                    )
-                    heartbeat.heal()
-                wait_for(lambda: heartbeat.success_count > 0)
-                wait_for(lambda: node.get_ranges() == ((0, RING_SIZE),))
-                assert node._polling_thread.is_alive()
-        levels = [call.args[0].levelno for call in emit.call_args_list]
-        if expire_ownership:
-            assert levels.count(logging.ERROR) == 1
-            assert levels.count(logging.INFO) == 1
-        else:
-            assert levels == [logging.WARNING]
-    finally:
-        logger.removeHandler(handler)
+            PubSub, "get_message", side_effect=RedisConnectionError()
+        ):
+            # The loop calls `get_message` for this notice, and the thread
+            # dies.
+            redis.publish(TEST_KEY, "*")
+            join_thread(node._polling_thread)
 
-
-# Keep the default `POLL_INTERVAL_SECONDS`, so that no heartbeat makes the
-# node read the ring during the test.
-@patch.multiple(
-    redis_hashring,
-    RETRY_INTERVAL_MIN_SECONDS=0.1,
-    RETRY_INTERVAL_MAX_SECONDS=0.1,
-)
-def test_thread_survives_closed_pubsub_connection(redis):
-    with RingNode(redis, TEST_KEY) as node1:
-        resubscribed = threading.Event()
-        ring_read_after_resubscribe = threading.Event()
-        original_subscribe = node1._subscribe
-        original_update = node1.update
-
-        def subscribe():
-            pubsub = original_subscribe()
-            resubscribed.set()
-            return pubsub
-
-        def update():
-            original_update()
-            if resubscribed.is_set():
-                ring_read_after_resubscribe.set()
-
-        node1._subscribe = subscribe
-        node1.update = update
-
-        client_ids = get_pubsub_client_ids(redis)
-        assert len(client_ids) == 1, client_ids
-        (client_id,) = client_ids
-        redis.client_kill_filter(_id=client_id)
-
-        # The thread subscribes again, on a new connection, and reads the
-        # ring.
-        assert ring_read_after_resubscribe.wait(timeout=5)
-        assert get_pubsub_client_ids(redis) - {client_id}
-
-        # Only a notice on the new subscription can make node 1 read the
-        # ring again, and see node 2 join.
-        with patch.object(socket, "gethostname", return_value="host2"):
-            node2 = RingNode(redis, TEST_KEY)
-        node2.heartbeat()
-        wait_for(lambda: node1.get_node_count() == 2)
-        node2.remove()
-
-
-@pytest.mark.usefixtures("short_intervals")
-def test_thread_survives_failed_heartbeat(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        ranges = node.get_ranges()
-        heartbeat = FailingCall(node.heartbeat, failures_left=1)
-        node.heartbeat = heartbeat
-
-        # The thread tries again, and the next heartbeat works.
-        wait_for(lambda: heartbeat.success_count > 0)
-        assert heartbeat.failure_count == 1
-        assert node._polling_thread.is_alive()
-        assert node.get_ranges() == ranges
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_gives_up_keys_without_heartbeats(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        ranges = node.get_ranges()
-        heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-        node.heartbeat = heartbeat
-
-        # After 0.4 s without a heartbeat, the node owns no keys.
-        wait_for(lambda: node.get_ranges() == ())
-        assert node.get_node_count() == 0
-        assert node.contains("item") is False
-
-        # When the heartbeat works again, the node gets its keys back.
-        heartbeat.heal()
-        wait_for(lambda: node.get_ranges() == ranges)
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_gives_up_keys_while_heartbeat_blocks(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        ranges = node.get_ranges()
-        heartbeat = BlockingCall(node.heartbeat)
-        node.heartbeat = heartbeat
-        # The number of heartbeats at each notice.
-        notices = []
-        original_notify = node._notify
-
-        def notify():
-            notices.append(heartbeat.call_count)
-            original_notify()
-
-        node._notify = notify
-
-        try:
-            assert heartbeat.started.wait(timeout=5)
-            # The thread waits in `heartbeat`. After the deadline of 0.4 s,
-            # readers see no keys.
-            wait_for(lambda: node.get_ranges() == ())
-            assert node.get_node_count() == 0
-            assert node.contains("item") is False
-        finally:
-            heartbeat.release.set()
-
-        # The heartbeat ends after the deadline, so the node notifies the
-        # other nodes right after it. Then the node gets its keys back.
-        wait_for(lambda: node.get_ranges() == ranges)
-        # The first notice came right after the heartbeat that blocked.
-        assert notices[0] == 1
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_gives_up_keys_while_update_fails(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        ranges = node.get_ranges()
-        # Count the heartbeats. All of them work.
-        heartbeat = FailingCall(node.heartbeat, failures_left=0)
-        node.heartbeat = heartbeat
-        fetch_ring = FailingCall(node._fetch_ring, failures_left=math.inf)
-        node._fetch_ring = fetch_ring
-
-        # No `update` works after the heartbeats. After 0.4 s, the node owns
-        # no keys.
-        wait_for(lambda: node.get_ranges() == ())
-        # More heartbeats without a successful `update` do not give the keys
-        # back.
-        heartbeat_count = heartbeat.success_count
-        wait_for(lambda: heartbeat.success_count >= heartbeat_count + 3)
-        assert node.get_ranges() == ()
-        assert node.get_node_count() == 0
-        assert node.contains("item") is False
-
-        # When `update` works again, the node gets its keys back.
-        fetch_ring.heal()
-        wait_for(lambda: node.get_ranges() == ranges)
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_logs_ownership_loss_and_recovery_once(redis, caplog):
-    caplog.set_level(logging.INFO, logger="redis_hashring")
-    with RingNode(redis, TEST_KEY, n_replicas=1) as node:
-        heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-        node.heartbeat = heartbeat
-        wait_for(lambda: log_records(caplog, logging.ERROR))
-        assert node.get_ranges() == ()
-        failure_count = heartbeat.failure_count
-        wait_for(lambda: heartbeat.failure_count >= failure_count + 3)
-
-        heartbeat.heal()
-        wait_for(lambda: log_records(caplog, logging.INFO))
-        assert node.get_ranges() == ((0, RING_SIZE),)
-
-    levels = [record.levelno for record in log_records(caplog)]
-    assert levels.count(logging.ERROR) == 1
-    assert levels.count(logging.INFO) == 1
-    assert levels[-1] == logging.INFO
-    (error_record,) = log_records(caplog, logging.ERROR)
-    assert error_record.exc_info[0] is RedisConnectionError
-    assert TEST_KEY in error_record.getMessage()
-    (info_record,) = log_records(caplog, logging.INFO)
-    assert TEST_KEY in info_record.getMessage()
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_logs_expiry_after_blocked_heartbeat(redis, caplog):
-    caplog.set_level(logging.INFO, logger="redis_hashring")
-    with RingNode(redis, TEST_KEY) as node:
-        heartbeat = BlockingCall(node.heartbeat)
-        node.heartbeat = heartbeat
-        try:
-            assert heartbeat.started.wait(timeout=5)
-            wait_for(lambda: node.get_ranges() == ())
-            time.sleep(0.2)
-            assert log_records(caplog) == []
-        finally:
-            heartbeat.release.set()
-        wait_for(lambda: log_records(caplog, logging.INFO))
-
-    error_record, info_record = log_records(caplog)
-    assert error_record.levelno == logging.ERROR
-    assert error_record.args[1] >= 0.2
-    assert error_record.exc_info is None
-    assert info_record.levelno == logging.INFO
-
-
-@patch.multiple(
-    redis_hashring,
-    POLL_INTERVAL_SECONDS=0.1,
-    NODE_TIMEOUT_SECONDS=0.5,
-    RETRY_INTERVAL_MIN_SECONDS=1,
-    RETRY_INTERVAL_MAX_SECONDS=1,
-)
-def test_node_logs_expiry_during_retry_wait(redis, caplog):
-    caplog.set_level(logging.INFO, logger="redis_hashring")
-    with RingNode(redis, TEST_KEY) as node:
-        heartbeat = FailingCall(node.heartbeat, failures_left=1)
-        node.heartbeat = heartbeat
-        wait_for(lambda: log_records(caplog, logging.INFO))
-
-    warning_record, error_record, info_record = log_records(caplog)
-    assert warning_record.levelno == logging.WARNING
-    assert error_record.levelno == logging.ERROR
-    assert error_record.exc_info[0] is RedisConnectionError
-    assert info_record.levelno == logging.INFO
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_thread_resets_deadline_when_it_exits(redis):
-    node = RingNode(redis, TEST_KEY)
-    with node:
-        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-        # The deadline passes, so readers see no keys.
-        wait_for(lambda: node.get_ranges() == ())
-    # Use the real `heartbeat` again.
-    del node.heartbeat
-
-    # Without the thread, no deadline applies to the state.
-    node.heartbeat()
-    node.update()
-    assert node.get_node_count() == 1
-    assert node.contains("item") is True
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-def test_node_notifies_other_nodes_when_it_joins_again(redis):
-    pubsub = redis.pubsub()
-    try:
-        pubsub.subscribe(TEST_KEY)
-        assert pubsub.get_message(timeout=5)["type"] == "subscribe"
-
-        with RingNode(redis, TEST_KEY) as node:
-            heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-            node.heartbeat = heartbeat
-            wait_for(lambda: node.get_ranges() == ())
-            # Drop the notices from before the outage.
-            while pubsub.get_message() is not None:
-                pass
-
-            # No cleanup removed the replicas of the node, so the heartbeat
-            # only updates their scores. The node sends the notice itself.
-            heartbeat.heal()
-            message = pubsub.get_message(timeout=5)
-            assert message is not None
-            assert message["type"] == "message"
-    finally:
-        pubsub.close()
-
-
-@pytest.mark.usefixtures("short_intervals")
-def test_node_reads_ring_after_each_heartbeat(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        # Another node joins, and the notice gets lost.
-        redis.zadd(TEST_KEY, {f"0:{OTHER_REPLICA}": time.time()})
-
-        wait_for(lambda: node.get_node_count() == 2)
-
-
-@pytest.mark.usefixtures("short_intervals")
-@patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
-@pytest.mark.parametrize("clean_up_expired_node", [False, True])
-def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
-    quarter = RING_SIZE // 4
-    with patch.object(socket, "gethostname", return_value="host1"):
-        node1 = RingNode(redis, TEST_KEY, n_replicas=1)
-    with patch.object(socket, "gethostname", return_value="host2"):
-        node2 = RingNode(redis, TEST_KEY, n_replicas=1)
-    node1._replicas = [(quarter, node1._replicas[0][1])]
-    node2._replicas = [(3 * quarter, node2._replicas[0][1])]
-    ranges1 = ((quarter, 3 * quarter),)
-    ranges2 = ((3 * quarter, RING_SIZE), (0, quarter))
-
-    with node1, node2:
-        wait_for(lambda: node1.get_ranges() == ranges1)
-        assert node2.get_ranges() == ranges2
-        assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
-
-        heartbeat = FailingCall(node1.heartbeat, failures_left=math.inf)
-        node1.heartbeat = heartbeat
-        wait_for(lambda: node1.get_ranges() == ())
-        assert node1.get_node_count() == 0
-        assert node1.contains("item") is False
-
-        wait_for(lambda: node2.get_ranges() == ((0, RING_SIZE),))
-        assert node2.get_node_count() == 1
-        assert node1.get_ranges() == ()
-        # Expiry changes ownership without deleting the stale replica.
-        assert redis.zcard(TEST_KEY) == 2
-        if clean_up_expired_node:
-            node2.cleanup()
-            assert redis.zcard(TEST_KEY) == 1
-
-        heartbeat.heal()
-        wait_for(
-            lambda: node1.get_ranges() == ranges1
-            and node2.get_ranges() == ranges2
-        )
-        assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
-        assert redis.zcard(TEST_KEY) == 2
-
-
-@pytest.mark.parametrize("failed_step", ["_notify", "update"])
-def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
-    node = RingNode(redis, TEST_KEY)
-    node.heartbeat()
-    node.update()
-    started_at = time.monotonic()
-    previous_heartbeat = started_at - redis_hashring.NODE_TIMEOUT_SECONDS
-    node._last_heartbeat_at = previous_heartbeat
-    node._ownership_valid_until = redis_hashring._deadline_after(
-        previous_heartbeat
-    )
-    previous_deadline = node._ownership_valid_until
-    assert node.get_ranges() == ()
-
-    with patch.object(
-        node, failed_step, side_effect=RedisConnectionError("renewal failed")
-    ):
-        with pytest.raises(RedisConnectionError, match="^renewal failed$"):
-            node._renew_ownership(started_at)
-
-    assert node._ownership_valid_until == previous_deadline
-    assert node.get_ranges() == ()
-    assert node._last_heartbeat_at == (
-        previous_heartbeat if failed_step == "_notify" else started_at
-    )
-
-
-# Keep the default `POLL_INTERVAL_SECONDS`, so that the first failed `update`
-# comes from a notice, not from a heartbeat.
-@patch.multiple(
-    redis_hashring,
-    RETRY_INTERVAL_MIN_SECONDS=0.1,
-    RETRY_INTERVAL_MAX_SECONDS=0.1,
-)
-def test_thread_survives_failed_update(redis):
-    with RingNode(redis, TEST_KEY) as node1:
-        fetch_ring = FailingCall(node1._fetch_ring, failures_left=math.inf)
-        node1._fetch_ring = fetch_ring
-
-        # Node 1 cannot read the ring after node 2 joins.
-        with patch.object(socket, "gethostname", return_value="host2"):
-            node2 = RingNode(redis, TEST_KEY)
-        node2.heartbeat()
-        wait_for(lambda: fetch_ring.failure_count > 0)
-        assert node1.get_node_count() == 1
-
-        # The thread tries again, and reads the ring.
-        fetch_ring.heal()
-        wait_for(lambda: node1.get_node_count() == 2)
-        assert node1._polling_thread.is_alive()
-        node2.remove()
-
-
-@patch.object(redis_hashring, "POLL_INTERVAL_SECONDS", 0.1)
-@patch.object(redis_hashring, "RETRY_INTERVAL_MIN_SECONDS", 10)
-def test_stop_while_heartbeat_fails(redis):
-    node = RingNode(redis, TEST_KEY)
-    node.start()
-    try:
-        retry_wait_started = threading.Event()
-        original_wait_before_retry = node._wait_before_retry
-
-        def wait_before_retry(retry_interval):
-            retry_wait_started.set()
-            original_wait_before_retry(retry_interval)
-
-        node._wait_before_retry = wait_before_retry
-        node.heartbeat = FailingCall(node.heartbeat, failures_left=math.inf)
-        # After the first failure, the thread waits at least 5 s before it
-        # tries again.
-        assert retry_wait_started.wait(timeout=5)
+        stop_polling_fd_r = node._stop_polling_fd_r
+        stop_polling_fd_w = node._stop_polling_fd_w
+        with patch.object(os, "close", wraps=os.close) as close:
+            join_thread(start_thread(node.stop))
     except BaseException:
-        # Stop the thread, so that it does not affect the next tests.
+        # If an assertion fails, the thread can still run. Stop it, so that
+        # it does not change the ring in the next tests.
         node.stop()
         raise
 
-    started_at = time.monotonic()
-    node.stop()
-    assert time.monotonic() - started_at < 2
-
-
-@pytest.mark.usefixtures("short_intervals")
-def test_thread_exits_when_stop_arrives_during_subscription(redis):
-    with RingNode(redis, TEST_KEY) as node:
-        original_subscribe = node._subscribe
-
-        def subscribe():
-            # `stop` asks the thread to exit while the thread subscribes.
-            node._stop_requested.set()
-            return original_subscribe()
-
-        node._subscribe = subscribe
-        # The failed heartbeat makes the thread subscribe again.
-        heartbeat = FailingCall(node.heartbeat, failures_left=1)
-        node.heartbeat = heartbeat
-
-        # The thread exits after the subscription, and sends no heartbeat.
-        join_thread(node._polling_thread)
-        assert heartbeat.failure_count == 1
-        assert heartbeat.success_count == 0
-
-
-# Keep the default `POLL_INTERVAL_SECONDS`, and make
-# `STOP_CHECK_INTERVAL_SECONDS` long. Then the wait for a notice after the
-# heartbeat is longer than the time limit of `join_thread`.
-@patch.multiple(
-    redis_hashring,
-    STOP_CHECK_INTERVAL_SECONDS=10,
-    RETRY_INTERVAL_MIN_SECONDS=0.1,
-    RETRY_INTERVAL_MAX_SECONDS=0.1,
-)
-def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
-    node = RingNode(redis, TEST_KEY)
-    node.start()
-    heartbeat = BlockingCall(node.heartbeat)
-    update = FailingCall(node.update, failures_left=1)
-    try:
-        node.heartbeat = heartbeat
-        # The failed update makes the thread subscribe again, and then send a
-        # heartbeat.
-        node.update = update
-        redis.publish(TEST_KEY, "*")
-        assert heartbeat.started.wait(timeout=5)
-    except BaseException:
-        # Stop the thread, so that it does not affect the next tests.
-        heartbeat.release.set()
-        node.stop()
-        raise
-
-    stop_thread = start_thread(node.stop)
-    try:
-        wait_for(node._stop_requested.is_set)
-    finally:
-        heartbeat.release.set()
-
-    # The thread exits after the heartbeat, before the update and the wait
-    # for a notice.
-    join_thread(stop_thread)
-    assert update.failure_count == 1
-    assert update.success_count == 0
+    close.assert_has_calls(
+        [call(stop_polling_fd_r), call(stop_polling_fd_w)], any_order=True
+    )
+    assert node._stop_polling_fd_r is None
+    assert node._stop_polling_fd_w is None
