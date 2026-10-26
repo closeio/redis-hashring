@@ -50,6 +50,9 @@ is responsible for the range [1e9, 2e9-1], the second node is responsible for
 key *hello* belongs, we compute its hash, which is 4 211 111 929, and the value
 is therefore on the second node.
 
+To compute the point of a key without a node, call `ring_point()` on the hash
+algorithm, for example `HashAlgorithm.XXHASH.ring_point("hello")`.
+
 Since the node replica points are picked randomly, it is recommended to have
 multiple replicas of the node on a ring to ensure a more even distribution of
 the nodes.
