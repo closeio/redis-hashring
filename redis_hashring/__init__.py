@@ -175,7 +175,7 @@ class RingNode(object):
         hash_algorithm=HashAlgorithm.XXHASH,
     ):
         """
-        Initializes a Redis hash ring node.
+        Initialize a Redis hash ring node.
 
         Args:
             conn: The Redis connection to use.
@@ -286,7 +286,7 @@ class RingNode(object):
 
     def debug_print(self):
         """
-        Prints the ring for debugging purposes.
+        Print the ring for debugging purposes.
         """
         ring = self._fetch_ring_all()
 
@@ -425,7 +425,7 @@ class RingNode(object):
 
     def cleanup(self):
         """
-        Removes expired nodes from the ring.
+        Remove expired nodes from the ring.
         """
         expired = time.time() - NODE_TIMEOUT_SECONDS
 
@@ -434,7 +434,7 @@ class RingNode(object):
 
     def update(self):
         """
-        Fetches the updated ring from Redis and updates the current ranges.
+        Fetch the updated ring from Redis and update the current ranges.
         """
         # Hold the lock during the fetch too. Otherwise, a call that fetched
         # an older ring can finish last, and the older ring wins.
