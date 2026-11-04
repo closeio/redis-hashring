@@ -65,23 +65,23 @@ def get_node(redis, n_replicas, total_replicas, hash_algorithm):
 def test_node(redis):
     with patch.object(socket, "gethostname", return_value="host1"):
         node1 = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
-    node1.update()
+    node1._update()
     assert len(node1.get_ranges()) == 1
     assert node1.get_node_count() == 1
 
     with patch.object(socket, "gethostname", return_value="host2"):
         node2 = get_node(redis, 1, 2, HashAlgorithm.XXHASH)
-    node1.update()
-    node2.update()
+    node1._update()
+    node2._update()
     assert len(node1.get_ranges()) + len(node2.get_ranges()) == 3
     assert node1.get_node_count() == 2
     assert node2.get_node_count() == 2
 
     with patch.object(socket, "gethostname", return_value="host3"):
         node3 = get_node(redis, 2, 4, HashAlgorithm.XXHASH)
-    node1.update()
-    node2.update()
-    node3.update()
+    node1._update()
+    node2._update()
+    node3._update()
     assert (
         len(node1.get_ranges())
         + len(node2.get_ranges())
@@ -93,8 +93,8 @@ def test_node(redis):
     assert node3.get_node_count() == 3
 
     node1.remove()
-    node2.update()
-    node3.update()
+    node2._update()
+    node3._update()
     assert len(node1.get_ranges()) == 0
     assert node1.get_node_count() == 0
     assert len(node2.get_ranges()) + len(node3.get_ranges()) == 4
@@ -107,7 +107,7 @@ def test_node(redis):
 )
 def test_contains(redis, hash_algorithm):
     node1 = get_node(redis, 1, 1, hash_algorithm=hash_algorithm)
-    node1.update()
+    node1._update()
     assert node1.contains("item") is True
 
     node1.remove()
@@ -221,7 +221,7 @@ def test_get_ranges_returns_tuple(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
     assert node.get_ranges() == ()
 
-    node.update()
+    node._update()
     assert isinstance(node.get_ranges(), tuple)
     assert node.get_ranges() == ((0, RING_SIZE),)
 
@@ -236,11 +236,11 @@ def test_readers_see_old_state_during_update(redis):
     key = find_key(node, 2**31, RING_SIZE)
 
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
-    node.update()
+    node._update()
 
     ring = PausingRing([(0, own_replica), (2**31, OTHER_REPLICA)])
     node._fetch_ring = Mock(return_value=ring)
-    update_thread = start_thread(node.update)
+    update_thread = start_thread(node._update)
     assert ring.paused.wait(timeout=5)
 
     assert node.get_ranges() == ((0, RING_SIZE),)
@@ -264,9 +264,9 @@ def test_update_calls_run_one_at_a_time(redis):
     )
     node._fetch_ring = fetch_ring
 
-    first_update_thread = start_thread(node.update)
+    first_update_thread = start_thread(node._update)
     assert fetch_ring.started.wait(timeout=5)
-    second_update_thread = start_thread(node.update)
+    second_update_thread = start_thread(node._update)
     # The second call waits for the first call, so it does not fetch yet.
     second_update_thread.join(timeout=0.1)
     assert second_update_thread.is_alive()
@@ -286,7 +286,7 @@ def test_failed_update_keeps_old_state(redis):
     node = RingNode(redis, TEST_KEY, n_replicas=1)
     own_replica = node._replicas[0][1]
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
-    node.update()
+    node._update()
 
     # The name of the second replica is malformed. The update computes the
     # first range, and then fails.
@@ -294,7 +294,7 @@ def test_failed_update_keeps_old_state(redis):
         return_value=[(0, own_replica), (2**31, "malformed")]
     )
     with pytest.raises(ValueError):
-        node.update()
+        node._update()
 
     assert node.get_ranges() == ((0, RING_SIZE),)
     assert node.get_node_count() == 1
@@ -307,10 +307,10 @@ def test_remove_waits_for_update(redis):
     fetch_ring = BlockingFetch([(0, own_replica)])
     node._fetch_ring = fetch_ring
 
-    update_thread = start_thread(node.update)
+    update_thread = start_thread(node._update)
     assert fetch_ring.started.wait(timeout=5)
     remove_thread = start_thread(node.remove)
-    # `remove` waits for `update`, so the node is still in the ring.
+    # `remove` waits for `_update`, so the node is still in the ring.
     remove_thread.join(timeout=0.1)
     assert remove_thread.is_alive()
     assert redis.zcard(TEST_KEY) == 1
@@ -326,7 +326,7 @@ def test_remove_waits_for_update(redis):
 
 def test_remove_clears_state_when_zrem_fails(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
-    node.update()
+    node._update()
 
     with patch.object(Pipeline, "execute", side_effect=RedisConnectionError()):
         with pytest.raises(RedisConnectionError):
@@ -339,7 +339,7 @@ def test_remove_clears_state_when_zrem_fails(redis):
 
 def test_remove_during_remove_on_same_thread(redis):
     node = get_node(redis, 1, 1, HashAlgorithm.XXHASH)
-    node.update()
+    node._update()
     execute = Pipeline.execute
     nested_calls = []
 
@@ -367,17 +367,17 @@ def test_remove_clears_state_after_update_on_same_thread(redis):
     nested_ranges = []
 
     def execute_with_nested_update(pipeline):
-        # Call `update` before the ZREM, on the same thread, like a signal
+        # Call `_update` before the ZREM, on the same thread, like a signal
         # handler that interrupts `remove`.
         if not nested_ranges:
-            node.update()
+            node._update()
             nested_ranges.append(node.get_ranges())
         return execute(pipeline)
 
     with patch.object(Pipeline, "execute", execute_with_nested_update):
         join_thread(start_thread(node.remove))
 
-    # The ring still had the node, so the nested `update` published ranges.
+    # The ring still had the node, so the nested `_update` published ranges.
     assert nested_ranges == [((0, RING_SIZE),)]
     assert redis.zcard(TEST_KEY) == 0
     assert node.get_ranges() == ()
@@ -391,12 +391,12 @@ def test_update_keeps_empty_state_after_remove_on_same_thread(redis):
 
     def fetch_ring_with_nested_remove():
         # Call `remove` during the fetch, on the same thread, like a signal
-        # handler that interrupts `update`.
+        # handler that interrupts `_update`.
         node.remove()
         return [(0, own_replica)]
 
     node._fetch_ring = fetch_ring_with_nested_remove
-    join_thread(start_thread(node.update))
+    join_thread(start_thread(node._update))
 
     assert redis.zcard(TEST_KEY) == 0
     assert node.get_ranges() == ()
@@ -405,7 +405,7 @@ def test_update_keeps_empty_state_after_remove_on_same_thread(redis):
 
     # The next update publishes its ranges.
     node._fetch_ring = Mock(return_value=[(0, own_replica)])
-    node.update()
+    node._update()
     assert node.get_ranges() == ((0, RING_SIZE),)
     assert node.get_node_count() == 1
 
@@ -422,7 +422,7 @@ def test_start_reads_subscription_reply_before_update(redis):
     node = RingNode(redis, TEST_KEY)
     events = []
     original_get_message = PubSub.get_message
-    original_update = node.update
+    original_update = node._update
 
     def get_message(pubsub, *args, **kwargs):
         message = original_get_message(pubsub, *args, **kwargs)
@@ -437,11 +437,11 @@ def test_start_reads_subscription_reply_before_update(redis):
     with patch.object(
         PubSub, "get_message", autospec=True, side_effect=get_message
     ):
-        with patch.object(node, "update", side_effect=update):
+        with patch.object(node, "_update", side_effect=update):
             with node:
                 pass
 
-    # The setup reads the reply to the subscription before it runs `update`.
+    # The setup reads the reply to the subscription before it runs `_update`.
     assert events[:2] == ["subscribe", "update"]
 
 
@@ -830,7 +830,7 @@ def test_thread_survives_closed_pubsub_connection(redis):
         resubscribed = threading.Event()
         ring_read_after_resubscribe = threading.Event()
         original_subscribe = node1._subscribe
-        original_update = node1.update
+        original_update = node1._update
 
         def subscribe():
             pubsub = original_subscribe()
@@ -843,7 +843,7 @@ def test_thread_survives_closed_pubsub_connection(redis):
                 ring_read_after_resubscribe.set()
 
         node1._subscribe = subscribe
-        node1.update = update
+        node1._update = update
 
         client_ids = get_pubsub_client_ids(redis)
         assert len(client_ids) == 1, client_ids
@@ -941,18 +941,20 @@ def test_node_gives_up_keys_while_update_fails(redis):
         fetch_ring = FailingCall(node._fetch_ring, failures_left=math.inf)
         node._fetch_ring = fetch_ring
 
-        # No `update` works after the heartbeats. After 0.4 s, the node owns
+        # No `_update` works after the heartbeats. After 0.4 s, the node owns
         # no keys.
         wait_for(lambda: node.get_ranges() == ())
-        # More heartbeats without a successful `update` do not give the keys
-        # back.
-        heartbeat_count = heartbeat.success_count
-        wait_for(lambda: heartbeat.success_count >= heartbeat_count + 3)
-        assert node.get_ranges() == ()
         assert node.get_node_count() == 0
         assert node.contains("item") is False
+        # While the ring reads fail, the node sends no heartbeats. Thus, the
+        # other nodes can see it as dead, and take over its keys.
+        heartbeat_count = heartbeat.success_count
+        failure_count = fetch_ring.failure_count
+        wait_for(lambda: fetch_ring.failure_count >= failure_count + 3)
+        assert heartbeat.success_count == heartbeat_count
+        assert node.get_ranges() == ()
 
-        # When `update` works again, the node gets its keys back.
+        # When `_update` works again, the node gets its keys back.
         fetch_ring.heal()
         wait_for(lambda: node.get_ranges() == ranges)
 
@@ -1041,7 +1043,7 @@ def test_thread_resets_deadline_when_it_exits(redis):
 
     # Without the thread, no deadline applies to the state.
     node.heartbeat()
-    node.update()
+    node._update()
     assert node.get_node_count() == 1
     assert node.contains("item") is True
 
@@ -1084,7 +1086,10 @@ def test_node_reads_ring_after_each_heartbeat(redis):
 @pytest.mark.usefixtures("short_intervals")
 @patch.object(redis_hashring, "NODE_TIMEOUT_SECONDS", 0.5)
 @pytest.mark.parametrize("clean_up_expired_node", [False, True])
-def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
+@pytest.mark.parametrize("failed_call", ["heartbeat", "_fetch_ring"])
+def test_two_nodes_handoff_and_recover(
+    redis, clean_up_expired_node, failed_call
+):
     quarter = RING_SIZE // 4
     with patch.object(socket, "gethostname", return_value="host1"):
         node1 = RingNode(redis, TEST_KEY, n_replicas=1)
@@ -1100,12 +1105,16 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
         assert node2.get_ranges() == ranges2
         assert (node1.get_node_count(), node2.get_node_count()) == (2, 2)
 
-        heartbeat = FailingCall(node1.heartbeat, failures_left=math.inf)
-        node1.heartbeat = heartbeat
+        failing_call = FailingCall(
+            getattr(node1, failed_call), failures_left=math.inf
+        )
+        setattr(node1, failed_call, failing_call)
         wait_for(lambda: node1.get_ranges() == ())
         assert node1.get_node_count() == 0
         assert node1.contains("item") is False
 
+        # Node 2 takes over the keys of node 1, even if node 1 can send
+        # heartbeats but cannot read the ring.
         wait_for(lambda: node2.get_ranges() == ((0, RING_SIZE),))
         assert node2.get_node_count() == 1
         assert node1.get_ranges() == ()
@@ -1115,7 +1124,7 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
             node2.cleanup()
             assert redis.zcard(TEST_KEY) == 1
 
-        heartbeat.heal()
+        failing_call.heal()
         wait_for(
             lambda: node1.get_ranges() == ranges1
             and node2.get_ranges() == ranges2
@@ -1124,11 +1133,11 @@ def test_two_nodes_handoff_and_recover(redis, clean_up_expired_node):
         assert redis.zcard(TEST_KEY) == 2
 
 
-@pytest.mark.parametrize("failed_step", ["_notify", "update"])
+@pytest.mark.parametrize("failed_step", ["_notify", "_update"])
 def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     node = RingNode(redis, TEST_KEY)
     node.heartbeat()
-    node.update()
+    node._update()
     started_at = time.monotonic()
     previous_heartbeat = started_at - redis_hashring.NODE_TIMEOUT_SECONDS
     node._last_heartbeat_at = previous_heartbeat
@@ -1151,7 +1160,7 @@ def test_failed_renewal_preserves_ownership_deadline(redis, failed_step):
     )
 
 
-# Keep the default `POLL_INTERVAL_SECONDS`, so that the first failed `update`
+# Keep the default `POLL_INTERVAL_SECONDS`, so that the first failed `_update`
 # comes from a notice, not from a heartbeat.
 @patch.multiple(
     redis_hashring,
@@ -1239,12 +1248,12 @@ def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     node = RingNode(redis, TEST_KEY)
     node.start()
     heartbeat = BlockingCall(node.heartbeat)
-    update = FailingCall(node.update, failures_left=1)
+    update = FailingCall(node._update, failures_left=1)
     try:
         node.heartbeat = heartbeat
-        # The failed update makes the thread subscribe again, and then send a
-        # heartbeat.
-        node.update = update
+        # The failed update makes the thread subscribe again, read the ring,
+        # and then send a heartbeat.
+        node._update = update
         redis.publish(TEST_KEY, "*")
         assert heartbeat.started.wait(timeout=5)
     except BaseException:
@@ -1259,8 +1268,9 @@ def test_thread_exits_when_stop_arrives_during_heartbeat(redis):
     finally:
         heartbeat.release.set()
 
-    # The thread exits after the heartbeat, before the update and the wait
-    # for a notice.
+    # The last update failed, so the thread runs one update before the
+    # heartbeat. The thread exits after the heartbeat, before the next update
+    # and the wait for a notice.
     join_thread(stop_thread)
     assert update.failure_count == 1
-    assert update.success_count == 0
+    assert update.success_count == 1

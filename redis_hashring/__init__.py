@@ -175,7 +175,7 @@ class RingNode(object):
         hash_algorithm=HashAlgorithm.XXHASH,
     ):
         """
-        Initializes a Redis hash ring node.
+        Initialize a Redis hash ring node.
 
         Args:
             conn: The Redis connection to use.
@@ -227,7 +227,7 @@ class RingNode(object):
         # `_read_state`. Writers replace the whole state with one assignment,
         # so a reader never sees a partial state.
         self._state = EMPTY_RING_STATE
-        # Makes sure that `update` and `remove` on different threads run one
+        # Makes sure that `_update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
         # `remove` can call `remove` again, and this lock does not block it.
         self._state_lock = threading.RLock()
@@ -241,6 +241,8 @@ class RingNode(object):
         # empty state. Readers compare it with the time at each call, so no
         # Redis call can delay the deadline.
         self._ownership_valid_until = math.inf
+        # Whether the last ring read of the polling thread failed.
+        self._ring_read_failed = False
         # Logging state, observed only by the polling thread.
         self._reported_ownership_expired = False
 
@@ -284,7 +286,7 @@ class RingNode(object):
 
     def debug_print(self):
         """
-        Prints the ring for debugging purposes.
+        Print the ring for debugging purposes.
         """
         ring = self._fetch_ring_all()
 
@@ -366,7 +368,7 @@ class RingNode(object):
 
         To leave the ring while the node runs, use `stop()`.
         """
-        # Hold the lock, so that an `update` that fetched the ring before the
+        # Hold the lock, so that an `_update` that fetched the ring before the
         # ZREM cannot publish its ranges after the empty state.
         with self._state_lock:
             self._removal_count += 1
@@ -380,7 +382,7 @@ class RingNode(object):
                     pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
                 pipeline.execute()
             finally:
-                # A signal handler on the main thread can call `update` during
+                # A signal handler on the main thread can call `_update` during
                 # the ZREM, and publish the ranges of a ring that still has
                 # this node. Then clear the state again.
                 self._state = EMPTY_RING_STATE
@@ -423,16 +425,28 @@ class RingNode(object):
 
     def cleanup(self):
         """
-        Removes expired nodes from the ring.
+        Remove expired nodes from the ring.
         """
         expired = time.time() - NODE_TIMEOUT_SECONDS
 
         if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
 
-    def update(self):
+    def _update_and_track_failure(self):
         """
-        Fetches the updated ring from Redis and updates the current ranges.
+        Update the current ranges, and record whether the update failed.
+
+        After a failure, the polling thread reads the ring again before its
+        next heartbeat. `_renew_ownership` explains why.
+        """
+        # Stays true if `_update` raises an exception.
+        self._ring_read_failed = True
+        self._update()
+        self._ring_read_failed = False
+
+    def _update(self):
+        """
+        Fetch the updated ring from Redis and update the current ranges.
         """
         # Hold the lock during the fetch too. Otherwise, a call that fetched
         # an older ring can finish last, and the older ring wins.
@@ -498,7 +512,7 @@ class RingNode(object):
 
         While the node runs, return an empty tuple after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._read_state().ranges
 
@@ -508,7 +522,7 @@ class RingNode(object):
 
         While the node runs, return 0 after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._read_state().node_count
 
@@ -518,7 +532,7 @@ class RingNode(object):
 
         While the node runs, return `False` after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._contains_ring_point(self.key_as_ring_point(key))
 
@@ -575,7 +589,7 @@ class RingNode(object):
         Keep the node in the ring until `stop` asks the thread to exit.
 
         First, run the setup: subscribe to the ring's activity channel, and
-        run `heartbeat`, `update`, and `cleanup`. Set `self._setup_done` when
+        run `heartbeat`, `_update`, and `cleanup`. Set `self._setup_done` when
         the setup ends. If the setup fails, store the error in
         `self._setup_error`. If the setup started to write to the ring, try
         to remove the node from the ring. Then return.
@@ -585,8 +599,8 @@ class RingNode(object):
         pubsub = None
         may_be_in_ring = False
         try:
-            # Subscribe before `update`, so that no change of the ring after
-            # `update` gets lost.
+            # Subscribe before `_update`, so that no change of the ring after
+            # `_update` gets lost.
             pubsub = self._subscribe()
 
             # From here on, the ring can hold replicas of this node, even if
@@ -597,7 +611,7 @@ class RingNode(object):
             self._last_heartbeat_at = time.monotonic()
             self.heartbeat()
 
-            self.update()
+            self._update_and_track_failure()
 
             last_cleanup_at = time.monotonic()
             self.cleanup()
@@ -628,10 +642,21 @@ class RingNode(object):
         """
         Renew membership and ownership, in that order.
 
+        If the last ring read failed, read the ring before the heartbeat. If
+        this read also fails, send no heartbeat. Without this check, the
+        heartbeats keep this node alive for the other nodes after its
+        ownership expires. Then no node owns the keys of this node.
+
         A failed notice leaves the heartbeat timestamp unchanged, so the
-        next attempt sends the notice again. A failed ring read keeps the
-        new heartbeat timestamp but does not extend ownership validity.
+        next attempt sends the notice again. A failed ring read after the
+        heartbeat keeps the new heartbeat timestamp but does not extend
+        ownership validity.
         """
+        if self._ring_read_failed:
+            self._update_and_track_failure()
+            if self._stop_requested.is_set():
+                return
+
         previous_deadline = _deadline_after(self._last_heartbeat_at)
         self.heartbeat()
         if self._stop_requested.is_set():
@@ -644,7 +669,7 @@ class RingNode(object):
 
         # Refresh even without a notice: a lost pub/sub connection can miss
         # changes. Publish the new ranges before extending their validity.
-        self.update()
+        self._update_and_track_failure()
         # A blocking Redis call may have let ownership expire without an
         # exception. Observe that transition before advancing the deadline.
         self._log_ownership_change()
@@ -661,7 +686,7 @@ class RingNode(object):
         if pubsub.get_message(timeout=timeout) is not None:
             while pubsub.get_message() is not None:
                 pass
-            self.update()
+            self._update_and_track_failure()
 
     def _run_loop(self, pubsub, last_cleanup_at):
         """Maintain the ring, retrying failed attempts until stopped."""
