@@ -227,7 +227,7 @@ class RingNode(object):
         # `_read_state`. Writers replace the whole state with one assignment,
         # so a reader never sees a partial state.
         self._state = EMPTY_RING_STATE
-        # Makes sure that `update` and `remove` on different threads run one
+        # Makes sure that `_update` and `remove` on different threads run one
         # at a time. The lock is reentrant: a signal handler that interrupts
         # `remove` can call `remove` again, and this lock does not block it.
         self._state_lock = threading.RLock()
@@ -368,7 +368,7 @@ class RingNode(object):
 
         To leave the ring while the node runs, use `stop()`.
         """
-        # Hold the lock, so that an `update` that fetched the ring before the
+        # Hold the lock, so that an `_update` that fetched the ring before the
         # ZREM cannot publish its ranges after the empty state.
         with self._state_lock:
             self._removal_count += 1
@@ -382,7 +382,7 @@ class RingNode(object):
                     pipeline.zrem(self._key, f"{replica[0]}:{replica[1]}")
                 pipeline.execute()
             finally:
-                # A signal handler on the main thread can call `update` during
+                # A signal handler on the main thread can call `_update` during
                 # the ZREM, and publish the ranges of a ring that still has
                 # this node. Then clear the state again.
                 self._state = EMPTY_RING_STATE
@@ -432,7 +432,7 @@ class RingNode(object):
         if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
 
-    def update(self):
+    def _update(self):
         """
         Fetch the updated ring from Redis and update the current ranges.
         """
@@ -500,7 +500,7 @@ class RingNode(object):
 
         While the node runs, return an empty tuple after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._read_state().ranges
 
@@ -510,7 +510,7 @@ class RingNode(object):
 
         While the node runs, return 0 after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._read_state().node_count
 
@@ -520,7 +520,7 @@ class RingNode(object):
 
         While the node runs, return `False` after
         `NODE_TIMEOUT_SECONDS - POLL_INTERVAL_SECONDS` seconds without a
-        heartbeat and a successful `update` after it.
+        heartbeat and a successful read of the ring after it.
         """
         return self._contains_ring_point(self.key_as_ring_point(key))
 
@@ -550,7 +550,7 @@ class RingNode(object):
     def _update_and_track_failure(self):
         # Stays true if the `update` below raises an exception.
         self._ring_read_failed = True
-        self.update()
+        self._update()
         self._ring_read_failed = False
 
     def _log_ownership_change(self, *, exc_info=None):
@@ -583,7 +583,7 @@ class RingNode(object):
         Keep the node in the ring until `stop` asks the thread to exit.
 
         First, run the setup: subscribe to the ring's activity channel, and
-        run `heartbeat`, `update`, and `cleanup`. Set `self._setup_done` when
+        run `heartbeat`, `_update`, and `cleanup`. Set `self._setup_done` when
         the setup ends. If the setup fails, store the error in
         `self._setup_error`. If the setup started to write to the ring, try
         to remove the node from the ring. Then return.
@@ -593,8 +593,8 @@ class RingNode(object):
         pubsub = None
         may_be_in_ring = False
         try:
-            # Subscribe before `update`, so that no change of the ring after
-            # `update` gets lost.
+            # Subscribe before `_update`, so that no change of the ring after
+            # `_update` gets lost.
             pubsub = self._subscribe()
 
             # From here on, the ring can hold replicas of this node, even if
