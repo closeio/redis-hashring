@@ -432,6 +432,18 @@ class RingNode(object):
         if self._conn.zremrangebyscore(self._key, 0, expired):
             self._notify()
 
+    def _update_and_track_failure(self):
+        """
+        Update the current ranges, and record whether the update failed.
+
+        After a failure, the polling thread reads the ring again before its
+        next heartbeat. `_renew_ownership` explains why.
+        """
+        # Stays true if `_update` raises an exception.
+        self._ring_read_failed = True
+        self._update()
+        self._ring_read_failed = False
+
     def _update(self):
         """
         Fetch the updated ring from Redis and update the current ranges.
@@ -546,12 +558,6 @@ class RingNode(object):
         Return early if `self._stop_requested` is set.
         """
         self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
-
-    def _update_and_track_failure(self):
-        # Stays true if the `update` below raises an exception.
-        self._ring_read_failed = True
-        self._update()
-        self._ring_read_failed = False
 
     def _log_ownership_change(self, *, exc_info=None):
         """Report each expiry and recovery once, when the thread observes it."""
