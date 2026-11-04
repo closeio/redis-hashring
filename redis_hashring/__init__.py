@@ -548,6 +548,7 @@ class RingNode(object):
         self._stop_requested.wait(retry_interval * random.uniform(0.5, 1))
 
     def _update_and_track_failure(self):
+        # Stays true if the `update` below raises an exception.
         self._ring_read_failed = True
         self.update()
         self._ring_read_failed = False
